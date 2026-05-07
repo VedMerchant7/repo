@@ -1,4 +1,4 @@
-"""Offline financial dashboard with optional live yfinance data."""
+"Offline financial dashboard with optional live yfinance data."
 
 from __future__ import annotations
 
@@ -1715,10 +1715,6 @@ with tabs[0]:
     val_cols[1].metric("Trailing P/E", f"{quote.get('trailing_pe') or (640 if not is_live_generic else np.nan):,.1f}x" if quote.get('trailing_pe') or not is_live_generic else "—")
     val_cols[2].metric("P/S on Revenue Base", f"{market_cap_b / base_revenue_b:,.1f}x")
     val_cols[3].metric("Revenue Base", f"${base_revenue_b:,.2f}B")
-    if is_live_generic:
-        st.info("This ticker is using generic live yfinance financials. For a fully bespoke dashboard, the segment/guidance/growth-history tabs need company-specific inputs.")
-    else:
-        st.warning("Valuation note: the fundamentals are exceptional, but the embedded expectations are also extreme. Use the Projection tab to stress-test bull/base/bear cases.")
 
 with tabs[1]:
     st.markdown("<div class='section-label'>Income Statement</div>", unsafe_allow_html=True)

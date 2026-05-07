@@ -1,4 +1,4 @@
-"Offline financial dashboard with optional live yfinance data."
+"""Offline financial dashboard with optional live yfinance data."""
 
 from __future__ import annotations
 
@@ -681,7 +681,7 @@ def get_market_data(ticker: str) -> Dict[str, Any]:
 
     return result
 
-# Embedded PLTR dashboard data
+# Embedded dashboard data
 # Values are USD millions unless noted.
 
 TICKER_DEFAULT = "PLTR"
@@ -859,114 +859,202 @@ def simple_statement_df(rows: List[Tuple[str, Optional[float], Optional[float], 
 
 
 def get_default_projection_assumptions(current_price: float) -> pd.DataFrame:
-    """Scenario assumptions for the revamped projection page."""
+    """Scenario assumptions. Margins anchor from current TTM margin."""
     return pd.DataFrame(
         [
             {
                 "Case": "Base",
-                "Revenue Growth %": 32.0,
-                "Starting Net Margin %": 28.0,
-                "Terminal Net Margin %": 36.0,
-                "Dilution CAGR %": 2.0,
-                "PE Low Start": 72.0,
-                "PE Low End": 55.0,
-                "PE High Start": 90.0,
-                "PE High End": 70.0,
+                "Revenue Growth %": 18.0,
+                "Terminal Net Margin %": 28.0,
+                "Dilution CAGR %": 1.0,
+                "Terminal PE Low": 28.0,
+                "Terminal PE High": 38.0,
             },
             {
                 "Case": "Bull",
-                "Revenue Growth %": 42.0,
-                "Starting Net Margin %": 30.0,
-                "Terminal Net Margin %": 42.0,
-                "Dilution CAGR %": 1.5,
-                "PE Low Start": 85.0,
-                "PE Low End": 70.0,
-                "PE High Start": 105.0,
-                "PE High End": 88.0,
+                "Revenue Growth %": 28.0,
+                "Terminal Net Margin %": 34.0,
+                "Dilution CAGR %": 0.5,
+                "Terminal PE Low": 40.0,
+                "Terminal PE High": 55.0,
             },
             {
                 "Case": "Bear",
-                "Revenue Growth %": 22.0,
-                "Starting Net Margin %": 25.0,
-                "Terminal Net Margin %": 28.0,
-                "Dilution CAGR %": 2.5,
-                "PE Low Start": 45.0,
-                "PE Low End": 30.0,
-                "PE High Start": 55.0,
-                "PE High End": 38.0,
+                "Revenue Growth %": 8.0,
+                "Terminal Net Margin %": 18.0,
+                "Dilution CAGR %": 1.5,
+                "Terminal PE Low": 16.0,
+                "Terminal PE High": 24.0,
             },
         ]
     )
 
 
+
+def _ttm_sum(raw: pd.DataFrame, possible_names: List[str]) -> float:
+    if raw is None or raw.empty:
+        return np.nan
+    cols = list(raw.columns)
+    try:
+        cols = sorted(cols, key=lambda c: pd.to_datetime(c), reverse=True)
+    except Exception:
+        pass
+    values = [_get_statement_value(raw, possible_names, c) for c in cols[:4]]
+    values = [v for v in values if not pd.isna(v)]
+    return float(sum(values)) if values else np.nan
+
+
+def _latest_statement_value(raw: pd.DataFrame, possible_names: List[str]) -> float:
+    if raw is None or raw.empty:
+        return np.nan
+    cols = list(raw.columns)
+    try:
+        cols = sorted(cols, key=lambda c: pd.to_datetime(c), reverse=True)
+    except Exception:
+        pass
+    if not cols:
+        return np.nan
+    return _get_statement_value(raw, possible_names, cols[0])
+
+
+def get_projection_anchor(
+    fundamentals: Dict[str, Any],
+    quote: Dict[str, Any],
+    fallback_revenue_b: float,
+    fallback_shares_b: float,
+    current_price: float,
+) -> Dict[str, float]:
+    income = fundamentals.get("income", pd.DataFrame()) if isinstance(fundamentals, dict) else pd.DataFrame()
+
+    revenue_ttm_raw = _ttm_sum(income, ["Total Revenue", "Operating Revenue"])
+    net_income_ttm_raw = _ttm_sum(income, ["Net Income", "Net Income Common Stockholders"])
+    eps_ttm = _ttm_sum(income, ["Diluted EPS", "Diluted EPS Diluted"])
+    diluted_shares_raw = _latest_statement_value(income, ["Diluted Average Shares", "Basic Average Shares"])
+
+    revenue_b = revenue_ttm_raw / 1_000_000_000 if not pd.isna(revenue_ttm_raw) and revenue_ttm_raw > 0 else fallback_revenue_b
+    net_income_b = net_income_ttm_raw / 1_000_000_000 if not pd.isna(net_income_ttm_raw) else np.nan
+
+    shares_from_quote_b = quote.get("shares") / 1_000_000_000 if quote.get("shares") else np.nan
+    shares_from_statement_b = diluted_shares_raw / 1_000_000_000 if not pd.isna(diluted_shares_raw) and diluted_shares_raw > 0 else np.nan
+    shares_b = shares_from_statement_b if not pd.isna(shares_from_statement_b) else shares_from_quote_b
+    if pd.isna(shares_b) or shares_b <= 0:
+        shares_b = fallback_shares_b
+
+    if pd.isna(eps_ttm) or eps_ttm <= 0:
+        eps_ttm = net_income_b / shares_b if not pd.isna(net_income_b) and shares_b else np.nan
+
+    if pd.isna(net_income_b) and not pd.isna(eps_ttm):
+        net_income_b = eps_ttm * shares_b
+
+    net_margin = safe_div(net_income_b, revenue_b)
+    if pd.isna(net_margin):
+        net_margin = 0.10
+
+    current_pe = safe_div(current_price, eps_ttm)
+    if pd.isna(current_pe) or current_pe <= 0:
+        current_pe = np.nan
+
+    return {
+        "revenue_b": float(revenue_b),
+        "net_income_b": float(net_income_b) if not pd.isna(net_income_b) else revenue_b * float(net_margin),
+        "net_margin": float(net_margin),
+        "eps": float(eps_ttm) if not pd.isna(eps_ttm) else safe_div(revenue_b * float(net_margin), shares_b),
+        "shares_b": float(shares_b),
+        "current_pe": float(current_pe) if not pd.isna(current_pe) else np.nan,
+    }
+
+
+def _attenuate(start: float, end: float, step: int, total_steps: int) -> float:
+    if total_steps <= 0:
+        return end
+    weight = step / total_steps
+    return start + (end - start) * weight
+
+
 def build_projection_matrices(
     current_price: float,
-    base_revenue_b: float,
-    shares_b: float,
+    anchor: Dict[str, float],
     years: int,
     assumptions: pd.DataFrame,
-    start_year: int = 2027,
+    current_year: int = 2026,
 ) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]:
-    """Build year-by-year scenario tables similar to the requested layout."""
+    """Build scenario tables anchored to current/TTM actual values, then project forward."""
     matrices: Dict[str, pd.DataFrame] = {}
     summary_rows: List[Dict[str, Any]] = []
+
+    base_revenue_b = float(anchor.get("revenue_b", 0))
+    base_net_income_b = float(anchor.get("net_income_b", 0))
+    base_margin = float(anchor.get("net_margin", 0))
+    base_eps = float(anchor.get("eps", np.nan))
+    base_shares_b = float(anchor.get("shares_b", 0))
+    current_pe = anchor.get("current_pe", np.nan)
 
     for _, r in assumptions.iterrows():
         case = str(r["Case"]).strip() or "Case"
         rev_growth = float(r["Revenue Growth %"]) / 100.0
-        start_margin = float(r["Starting Net Margin %"]) / 100.0
         terminal_margin = float(r["Terminal Net Margin %"]) / 100.0
         dilution = float(r["Dilution CAGR %"]) / 100.0
-        pe_low_start = float(r["PE Low Start"])
-        pe_low_end = float(r["PE Low End"])
-        pe_high_start = float(r["PE High Start"])
-        pe_high_end = float(r["PE High End"])
+        terminal_pe_low = float(r["Terminal PE Low"])
+        terminal_pe_high = float(r["Terminal PE High"])
 
-        year_labels = [str(start_year + i) for i in range(years)]
-        margin_series = np.linspace(start_margin, terminal_margin, years)
-        pe_low_series = np.linspace(pe_low_start, pe_low_end, years)
-        pe_high_series = np.linspace(pe_high_start, pe_high_end, years)
+        year_labels = [f"{current_year} Current"] + [str(current_year + i) for i in range(1, years + 1)]
 
-        revenues = []
-        net_incomes = []
-        eps_values = []
-        share_low = []
-        share_high = []
-        cagr_low = []
-        cagr_high = []
+        revenues = [base_revenue_b]
+        rev_growth_row = [np.nan]
+        net_incomes = [base_net_income_b]
+        ni_growth_row = [np.nan]
+        margins = [base_margin]
+        eps_values = [base_eps]
+        pe_low_values = [current_pe]
+        pe_high_values = [current_pe]
+        share_low = [current_price]
+        share_high = [current_price]
+        cagr_low = [np.nan]
+        cagr_high = [np.nan]
 
-        for i in range(years):
-            horizon = i + 1
-            revenue_i = base_revenue_b * ((1 + rev_growth) ** horizon)
-            margin_i = float(margin_series[i])
-            shares_i = shares_b * ((1 + dilution) ** horizon)
+        previous_revenue = base_revenue_b
+        previous_net_income = base_net_income_b
+
+        for step in range(1, years + 1):
+            revenue_i = previous_revenue * (1 + rev_growth)
+            margin_i = _attenuate(base_margin, terminal_margin, step, years)
+            shares_i = base_shares_b * ((1 + dilution) ** step)
             net_income_i = revenue_i * margin_i
             eps_i = net_income_i / shares_i if shares_i else np.nan
-            low_i = eps_i * pe_low_series[i]
-            high_i = eps_i * pe_high_series[i]
-            cagr_low_i = calc_cagr(current_price, low_i, horizon) if current_price and low_i > 0 else np.nan
-            cagr_high_i = calc_cagr(current_price, high_i, horizon) if current_price and high_i > 0 else np.nan
+
+            starting_pe_low = current_pe if not pd.isna(current_pe) and current_pe > 0 else terminal_pe_low
+            starting_pe_high = current_pe if not pd.isna(current_pe) and current_pe > 0 else terminal_pe_high
+            pe_low_i = _attenuate(starting_pe_low, terminal_pe_low, step, years)
+            pe_high_i = _attenuate(starting_pe_high, terminal_pe_high, step, years)
+
+            low_i = eps_i * pe_low_i
+            high_i = eps_i * pe_high_i
 
             revenues.append(revenue_i)
+            rev_growth_row.append(rev_growth)
             net_incomes.append(net_income_i)
+            ni_growth_row.append(safe_div(net_income_i, previous_net_income) - 1 if previous_net_income else np.nan)
+            margins.append(margin_i)
             eps_values.append(eps_i)
+            pe_low_values.append(pe_low_i)
+            pe_high_values.append(pe_high_i)
             share_low.append(low_i)
             share_high.append(high_i)
-            cagr_low.append(cagr_low_i)
-            cagr_high.append(cagr_high_i)
+            cagr_low.append(calc_cagr(current_price, low_i, step) if current_price and low_i > 0 else np.nan)
+            cagr_high.append(calc_cagr(current_price, high_i, step) if current_price and high_i > 0 else np.nan)
 
-        rev_growth_row = [np.nan] + [rev_growth] * (years - 1)
-        ni_growth_row = [np.nan] + [safe_div(net_incomes[i], net_incomes[i-1]) - 1 if net_incomes[i-1] else np.nan for i in range(1, years)]
+            previous_revenue = revenue_i
+            previous_net_income = net_income_i
 
         row_map = {
             "REVENUE": revenues,
             "REV GROWTH": rev_growth_row,
             "NET INCOME": net_incomes,
             "NET INC. GROWTH": ni_growth_row,
-            "NET INC. MARGINS": list(margin_series),
+            "NET INC. MARGINS": margins,
             "EPS": eps_values,
-            "PE LOW EST": list(pe_low_series),
-            "PE HIGH EST": list(pe_high_series),
+            "PE LOW EST": pe_low_values,
+            "PE HIGH EST": pe_high_values,
             "SHARE PRICE LOW": share_low,
             "SHARE PRICE HIGH": share_high,
             "CAGR LOW": cagr_low,
@@ -983,7 +1071,7 @@ def build_projection_matrices(
                 "Case": case,
                 "Final Year": year_labels[-1],
                 "Revenue ($B)": revenues[-1],
-                "Net Margin": margin_series[-1],
+                "Net Margin": margins[-1],
                 "EPS": eps_values[-1],
                 "Price Low": share_low[-1],
                 "Price High": share_high[-1],
@@ -993,7 +1081,6 @@ def build_projection_matrices(
         )
 
     return matrices, pd.DataFrame(summary_rows)
-
 
 def _format_projection_value(metric: str, value: Any) -> str:
     if pd.isna(value):
@@ -1715,6 +1802,10 @@ with tabs[0]:
     val_cols[1].metric("Trailing P/E", f"{quote.get('trailing_pe') or (640 if not is_live_generic else np.nan):,.1f}x" if quote.get('trailing_pe') or not is_live_generic else "—")
     val_cols[2].metric("P/S on Revenue Base", f"{market_cap_b / base_revenue_b:,.1f}x")
     val_cols[3].metric("Revenue Base", f"${base_revenue_b:,.2f}B")
+    if is_live_generic:
+        st.info("This ticker is using generic live yfinance financials. For a fully bespoke dashboard, the segment/guidance/growth-history tabs need company-specific inputs.")
+    else:
+        st.warning("Valuation note: the fundamentals are exceptional, but the embedded expectations are also extreme. Use the Projection tab to stress-test bull/base/bear cases.")
 
 with tabs[1]:
     st.markdown("<div class='section-label'>Income Statement</div>", unsafe_allow_html=True)
@@ -1861,7 +1952,7 @@ with tabs[5]:
 
 with tabs[6]:
     st.markdown("<div class='section-label'>Scenario Projection Matrix</div>", unsafe_allow_html=True)
-    st.caption("Projection starts from the current stock price and the current revenue base. The first projection column is 2027.")
+    st.caption("Projection now anchors to current/TTM revenue, net income margin, EPS, and stock price. 2026 Current is the anchor column; 2027 onward is projected.")
 
     projection_years = st.slider("Projection years", 1, 10, projection_years)
     assumptions_default = get_default_projection_assumptions(current_price)
@@ -1872,23 +1963,21 @@ with tabs[6]:
             use_container_width=True,
             column_config={
                 "Revenue Growth %": st.column_config.NumberColumn(format="%.1f%%"),
-                "Starting Net Margin %": st.column_config.NumberColumn(format="%.1f%%"),
                 "Terminal Net Margin %": st.column_config.NumberColumn(format="%.1f%%"),
                 "Dilution CAGR %": st.column_config.NumberColumn(format="%.1f%%"),
-                "PE Low Start": st.column_config.NumberColumn(format="%.1fx"),
-                "PE Low End": st.column_config.NumberColumn(format="%.1fx"),
-                "PE High Start": st.column_config.NumberColumn(format="%.1fx"),
-                "PE High End": st.column_config.NumberColumn(format="%.1fx"),
+                "Terminal PE Low": st.column_config.NumberColumn(format="%.1fx"),
+                "Terminal PE High": st.column_config.NumberColumn(format="%.1fx"),
             },
         )
 
     stat1, stat2, stat3, stat4 = st.columns(4)
     stat1.metric("Current Price", f"${current_price:,.2f}")
-    stat2.metric("2026 Revenue Base", f"${base_revenue_b:,.2f}B")
-    stat3.metric("Diluted Shares", f"{shares_b:,.2f}B")
+    projection_anchor = get_projection_anchor(fundamentals, quote, base_revenue_b, shares_b, current_price)
+    stat2.metric("2026 Revenue Base", f"${projection_anchor['revenue_b']:,.2f}B")
+    stat3.metric("Current TTM EPS", f"${projection_anchor['eps']:,.2f}")
     stat4.metric("Projection Period", f"2027–{2026 + projection_years}")
 
-    matrices, proj_summary = build_projection_matrices(current_price, base_revenue_b, shares_b, projection_years, assumptions_default if 'assumptions' not in locals() else assumptions)
+    matrices, proj_summary = build_projection_matrices(current_price, projection_anchor, projection_years, assumptions_default if 'assumptions' not in locals() else assumptions)
 
     if not proj_summary.empty:
         summary_fmt = proj_summary.copy()
@@ -1903,7 +1992,7 @@ with tabs[6]:
         display_df(summary_fmt, height=220, style_rows=False)
 
     st.markdown("<div class='section-label'>Scenario Tables</div>", unsafe_allow_html=True)
-    st.caption(f"Current stock price is the CAGR starting point: ${current_price:,.2f}. The first projection column is 2027, not the 2026 base year.")
+    st.caption(f"Current stock price is the CAGR starting point: ${current_price:,.2f}. The first column anchors 2026 current/TTM values; projections begin in 2027.")
     for case_name in ["Base", "Bull", "Bear"]:
         if case_name in matrices:
             render_projection_case_table(case_name, matrices[case_name])

@@ -457,7 +457,7 @@ def classify_table_row(row: pd.Series) -> str:
         "NET CASH FROM FINANCING",
         "GAAP FREE CASH FLOW",
     }
-    if upper in subtotal_rows or (upper.startswith("TOTAL ") and upper not in grand_rows):
+    if upper.startswith("TOTAL RETURNS") or upper in subtotal_rows or (upper.startswith("TOTAL ") and upper not in grand_rows):
         return "subtotal"
 
     return "normal"
@@ -727,6 +727,8 @@ income_rows = [
     ("GAAP Diluted EPS", 0.08, 0.07, 0.34, "eps"),
     ("Adj. Diluted EPS", 0.13, 0.14, 0.33, "eps"),
     ("GAAP NET INCOME", 214, 187, 871, "grand"),
+    ("SHAREHOLDER RETURNS", None, None, None, None),
+    ("Total Returns (Divs + Buybacks)", 1770, 2440, 519, "subtotal"),
 ]
 
 balance_rows = [
@@ -914,6 +916,46 @@ def _latest_statement_value(raw: pd.DataFrame, possible_names: List[str]) -> flo
     if not cols:
         return np.nan
     return _get_statement_value(raw, possible_names, cols[0])
+
+
+
+def _shareholder_return_components(cashflow_raw: pd.DataFrame, col: Any) -> Tuple[float, float, float]:
+    """Return dividends, buybacks, and total shareholder returns for a cash-flow period."""
+    if cashflow_raw is None or cashflow_raw.empty or col is None:
+        return np.nan, np.nan, np.nan
+
+    dividends = _get_statement_value(
+        cashflow_raw,
+        ["Cash Dividends Paid", "Common Stock Dividend Paid", "Cash Dividend Paid"],
+        col,
+    )
+    buybacks = _get_statement_value(
+        cashflow_raw,
+        ["Repurchase Of Capital Stock", "Repurchase Of Stock", "Stock Repurchase", "Repurchase Of Common Stock"],
+        col,
+    )
+
+    div_abs = abs(dividends) if not pd.isna(dividends) else 0.0
+    buyback_abs = abs(buybacks) if not pd.isna(buybacks) else 0.0
+    total = div_abs + buyback_abs
+    if total == 0:
+        total = np.nan
+    return div_abs, buyback_abs, total
+
+
+def _shareholder_return_summary_from_cashflow(fundamentals: Dict[str, Any]) -> Tuple[float, float, float]:
+    """Latest-quarter shareholder returns: dividends + buybacks."""
+    cashflow = fundamentals.get("cashflow", pd.DataFrame()) if isinstance(fundamentals, dict) else pd.DataFrame()
+    if cashflow is None or cashflow.empty:
+        return np.nan, np.nan, np.nan
+    cols = list(cashflow.columns)
+    try:
+        cols = sorted(cols, key=lambda c: pd.to_datetime(c), reverse=True)
+    except Exception:
+        pass
+    latest_col = cols[0] if cols else None
+    return _shareholder_return_components(cashflow, latest_col)
+
 
 
 def get_projection_anchor(
@@ -1333,6 +1375,8 @@ def build_live_statement_table_wide(fundamentals: Dict[str, Any], statement_type
     if statement_type == "income":
         annual_raw = fundamentals.get("annual_income", pd.DataFrame())
         quarter_raw = fundamentals.get("income", pd.DataFrame())
+        annual_cashflow_raw = fundamentals.get("annual_cashflow", pd.DataFrame())
+        quarter_cashflow_raw = fundamentals.get("cashflow", pd.DataFrame())
         sections = [
             ("REVENUE & PROFITABILITY", [
                 ("Total Revenue", ["Total Revenue", "Operating Revenue"], "money", "margin_base"),
@@ -1350,8 +1394,13 @@ def build_live_statement_table_wide(fundamentals: Dict[str, Any], statement_type
                 ("Net Income", ["Net Income", "Net Income Common Stockholders"], "money", "net_margin"),
                 ("Diluted EPS", ["Diluted EPS", "Diluted EPS Diluted"], "eps", None),
             ]),
+            ("SHAREHOLDER RETURNS", [
+                ("Total Returns (Divs + Buybacks)", ["__SHAREHOLDER_RETURNS__"], "money", None),
+            ]),
         ]
     elif statement_type == "balance":
+        annual_cashflow_raw = pd.DataFrame()
+        quarter_cashflow_raw = pd.DataFrame()
         annual_raw = fundamentals.get("annual_balance", pd.DataFrame())
         quarter_raw = fundamentals.get("balance", pd.DataFrame())
         sections = [
@@ -1372,6 +1421,8 @@ def build_live_statement_table_wide(fundamentals: Dict[str, Any], statement_type
             ]),
         ]
     else:
+        annual_cashflow_raw = pd.DataFrame()
+        quarter_cashflow_raw = pd.DataFrame()
         annual_raw = fundamentals.get("annual_cashflow", pd.DataFrame())
         quarter_raw = fundamentals.get("cashflow", pd.DataFrame())
         sections = [
@@ -1447,8 +1498,19 @@ def build_live_statement_table_wide(fundamentals: Dict[str, Any], statement_type
     for section_name, items in sections:
         rows.append({"Line Item": section_name, **{c: "" for c in display_cols}, "YoY Δ": "", "QoQ Δ": "", "Margin": ""})
         for label, possible, kind, metric_tag in items:
-            annual_vals = [_get_statement_value(annual_raw, possible, c) for c in annual_cols] if annual_cols else []
-            q_val = _get_statement_value(quarter_raw, possible, latest_q) if latest_q is not None else np.nan
+            is_shareholder_return = possible == ["__SHAREHOLDER_RETURNS__"]
+
+            if is_shareholder_return:
+                annual_vals = []
+                annual_notes = {}
+                for c in annual_cols:
+                    divs, buybacks, total = _shareholder_return_components(annual_cashflow_raw, c)
+                    annual_vals.append(total)
+                    annual_notes[_period_label(c)] = (divs, buybacks)
+                divs_q, buybacks_q, q_val = _shareholder_return_components(quarter_cashflow_raw, latest_q) if latest_q is not None else (np.nan, np.nan, np.nan)
+            else:
+                annual_vals = [_get_statement_value(annual_raw, possible, c) for c in annual_cols] if annual_cols else []
+                q_val = _get_statement_value(quarter_raw, possible, latest_q) if latest_q is not None else np.nan
 
             if all(pd.isna(v) for v in annual_vals) and pd.isna(q_val):
                 continue
@@ -1459,11 +1521,26 @@ def build_live_statement_table_wide(fundamentals: Dict[str, Any], statement_type
             if latest_q is not None:
                 row[q_label] = _fmt_raw_number(q_val, kind)
 
-            prior_y_val = _get_statement_value(quarter_raw, possible, prior_y_q) if prior_y_q is not None else np.nan
-            prior_q_val = _get_statement_value(quarter_raw, possible, prior_q) if prior_q is not None else np.nan
-            row["YoY Δ"] = _pct_change(q_val, prior_y_val)
-            row["QoQ Δ"] = _pct_change(q_val, prior_q_val)
-            row["Margin"] = margin_for(metric_tag, quarter_raw, latest_q, q_val)
+            if is_shareholder_return:
+                prior_y_val = np.nan
+                prior_q_val = np.nan
+                if prior_y_q is not None:
+                    _, _, prior_y_val = _shareholder_return_components(quarter_cashflow_raw, prior_y_q)
+                if prior_q is not None:
+                    _, _, prior_q_val = _shareholder_return_components(quarter_cashflow_raw, prior_q)
+                row["YoY Δ"] = _pct_change(q_val, prior_y_val)
+                row["QoQ Δ"] = _pct_change(q_val, prior_q_val)
+                if not pd.isna(divs_q) or not pd.isna(buybacks_q):
+                    row["Margin"] = f"Divs {_fmt_raw_money_to_m(divs_q)} · Buybacks {_fmt_raw_money_to_m(buybacks_q)}"
+                else:
+                    row["Margin"] = "—"
+            else:
+                prior_y_val = _get_statement_value(quarter_raw, possible, prior_y_q) if prior_y_q is not None else np.nan
+                prior_q_val = _get_statement_value(quarter_raw, possible, prior_q) if prior_q is not None else np.nan
+                row["YoY Δ"] = _pct_change(q_val, prior_y_val)
+                row["QoQ Δ"] = _pct_change(q_val, prior_q_val)
+                row["Margin"] = margin_for(metric_tag, quarter_raw, latest_q, q_val)
+
             rows.append(row)
 
     return pd.DataFrame(rows)
@@ -1765,6 +1842,7 @@ def _latest_percent_from_table(df: pd.DataFrame, line_item_keywords: List[str], 
 
 def make_income_summary(df: pd.DataFrame) -> str:
     revenue = _latest_numeric_from_table(df, ["total revenue", "revenue"], exclude_keywords=["cost", "expense"])
+    shareholder_returns = _latest_numeric_from_table(df, ["total returns", "divs + buybacks"])
     gross_margin = _latest_percent_from_table(df, ["gross profit"])
     op_margin = _latest_percent_from_table(df, ["operating income"])
     net_margin = _latest_percent_from_table(df, ["net income"])
@@ -1777,6 +1855,8 @@ def make_income_summary(df: pd.DataFrame) -> str:
         parts.append(f"Operating margin is {op_margin:.1f}%, showing current operating leverage.")
     if not pd.isna(net_margin):
         parts.append(f"Net margin is {net_margin:.1f}%, the cleanest quick read on bottom-line conversion.")
+    if not pd.isna(shareholder_returns):
+        parts.append(f"Shareholder return: latest dividends plus buybacks were about ${shareholder_returns/1000:,.2f}B.")
     return " ".join(parts) if parts else "I could not calculate a clean income-statement read from the available rows."
 
 

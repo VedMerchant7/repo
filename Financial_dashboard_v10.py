@@ -863,30 +863,125 @@ def simple_statement_df(rows: List[Tuple[str, Optional[float], Optional[float], 
 
 
 
-def get_default_projection_assumptions(current_price: float) -> pd.DataFrame:
-    """Scenario assumptions. Margins anchor from current TTM margin."""
+def _clamp(value: float, low: float, high: float) -> float:
+    if pd.isna(value):
+        return low
+    return max(low, min(high, float(value)))
+
+
+def _historical_revenue_cagr_from_fundamentals(fundamentals: Dict[str, Any]) -> float:
+    """Return revenue CAGR as a decimal from available annual yfinance history."""
+    annual = build_live_annual_metrics(fundamentals)
+    if annual is None or annual.empty or "Revenue" not in annual.columns:
+        return np.nan
+
+    clean = annual.dropna(subset=["Revenue"]).copy()
+    clean = clean[clean["Revenue"] > 0]
+    if len(clean) < 2:
+        return np.nan
+
+    start = float(clean["Revenue"].iloc[0])
+    end = float(clean["Revenue"].iloc[-1])
+    years = max(len(clean) - 1, 1)
+    return calc_cagr(start, end, years)
+
+
+def _recent_revenue_growth_from_fundamentals(fundamentals: Dict[str, Any]) -> float:
+    """Return latest fiscal-year revenue growth as a decimal."""
+    annual = build_live_annual_metrics(fundamentals)
+    if annual is None or annual.empty or "Revenue" not in annual.columns:
+        return np.nan
+
+    clean = annual.dropna(subset=["Revenue"]).copy()
+    clean = clean[clean["Revenue"] > 0]
+    if len(clean) < 2:
+        return np.nan
+
+    prev = float(clean["Revenue"].iloc[-2])
+    latest = float(clean["Revenue"].iloc[-1])
+    return safe_div(latest, prev) - 1 if prev else np.nan
+
+
+def get_default_projection_assumptions(
+    current_price: float,
+    fundamentals: Optional[Dict[str, Any]] = None,
+    anchor: Optional[Dict[str, float]] = None,
+    quote: Optional[Dict[str, Any]] = None,
+) -> pd.DataFrame:
+    """Build ticker-specific scenario assumptions from current valuation and historical growth."""
+    fundamentals = fundamentals or {}
+    quote = quote or {}
+    anchor = anchor or {}
+
+    hist_cagr = _historical_revenue_cagr_from_fundamentals(fundamentals)
+    recent_growth = _recent_revenue_growth_from_fundamentals(fundamentals)
+
+    if pd.isna(hist_cagr) and not pd.isna(recent_growth):
+        base_growth = recent_growth
+    elif pd.isna(recent_growth) and not pd.isna(hist_cagr):
+        base_growth = hist_cagr
+    elif not pd.isna(hist_cagr) and not pd.isna(recent_growth):
+        base_growth = 0.60 * hist_cagr + 0.40 * recent_growth
+    else:
+        base_growth = 0.10
+
+    base_growth = _clamp(base_growth, -0.05, 0.35)
+    bear_growth = _clamp(base_growth * 0.45, -0.10, 0.18)
+    bull_growth = _clamp(base_growth * 1.55 + 0.03, 0.03, 0.55)
+
+    current_margin = float(anchor.get("net_margin", np.nan))
+    if pd.isna(current_margin):
+        current_margin = 0.10
+
+    # Terminal margins move from current economics, but stay in realistic broad bounds.
+    bear_margin = _clamp(current_margin * 0.75, -0.05, 0.30)
+    base_margin = _clamp(current_margin + 0.04, 0.03, 0.35)
+    bull_margin = _clamp(current_margin + 0.09, 0.06, 0.45)
+
+    current_pe = anchor.get("current_pe", np.nan)
+    forward_pe = quote.get("forward_pe") if isinstance(quote, dict) else np.nan
+    trailing_pe = quote.get("trailing_pe") if isinstance(quote, dict) else np.nan
+
+    pe_anchor_candidates = [x for x in [forward_pe, trailing_pe, current_pe] if x is not None and not pd.isna(x) and float(x) > 0]
+    if pe_anchor_candidates:
+        pe_anchor = float(pe_anchor_candidates[0])
+    else:
+        # Growth-sensitive fallback: mature low-growth names should not get software-style multiples.
+        pe_anchor = 14 + max(base_growth, 0) * 85
+
+    pe_anchor = _clamp(pe_anchor, 6, 90)
+
+    # Terminal multiples are anchored to growth and current valuation, with compression built in.
+    growth_multiple_base = 14 + max(base_growth, 0) * 95
+    growth_multiple_bear = 10 + max(bear_growth, 0) * 65
+    growth_multiple_bull = 18 + max(bull_growth, 0) * 110
+
+    base_pe_mid = _clamp(0.55 * pe_anchor + 0.45 * growth_multiple_base, 8, 70)
+    bear_pe_mid = _clamp(min(base_pe_mid * 0.65, growth_multiple_bear), 5, 45)
+    bull_pe_mid = _clamp(max(base_pe_mid * 1.25, growth_multiple_bull), 12, 95)
+
     return pd.DataFrame(
         [
             {
                 "Case": "Base",
-                "Revenue Growth %": 18.0,
-                "Terminal Net Margin %": 28.0,
-                "Terminal PE Low": 28.0,
-                "Terminal PE High": 38.0,
+                "Revenue Growth %": round(base_growth * 100, 1),
+                "Terminal Net Margin %": round(base_margin * 100, 1),
+                "Terminal PE Low": round(base_pe_mid * 0.85, 1),
+                "Terminal PE High": round(base_pe_mid * 1.15, 1),
             },
             {
                 "Case": "Bull",
-                "Revenue Growth %": 28.0,
-                "Terminal Net Margin %": 34.0,
-                "Terminal PE Low": 40.0,
-                "Terminal PE High": 55.0,
+                "Revenue Growth %": round(bull_growth * 100, 1),
+                "Terminal Net Margin %": round(bull_margin * 100, 1),
+                "Terminal PE Low": round(bull_pe_mid * 0.90, 1),
+                "Terminal PE High": round(bull_pe_mid * 1.20, 1),
             },
             {
                 "Case": "Bear",
-                "Revenue Growth %": 8.0,
-                "Terminal Net Margin %": 18.0,
-                "Terminal PE Low": 16.0,
-                "Terminal PE High": 24.0,
+                "Revenue Growth %": round(bear_growth * 100, 1),
+                "Terminal Net Margin %": round(bear_margin * 100, 1),
+                "Terminal PE Low": round(bear_pe_mid * 0.80, 1),
+                "Terminal PE High": round(bear_pe_mid * 1.05, 1),
             },
         ]
     )
@@ -2269,10 +2364,22 @@ with tabs[6]:
     st.caption("Projection anchors to current/TTM revenue, net income margin, EPS, shares, and stock price. 2026 Current is the anchor column; 2027 onward is projected.")
 
     projection_years = st.slider("Projection years", 1, 10, projection_years)
-    assumptions_default = get_default_projection_assumptions(current_price)
+    projection_anchor = get_projection_anchor(fundamentals, quote, base_revenue_b, shares_b, current_price)
+    assumptions_default = get_default_projection_assumptions(current_price, fundamentals, projection_anchor, quote)
+
+    default_key_parts = [
+        ticker,
+        f"{projection_anchor.get('revenue_b', 0):.2f}",
+        f"{projection_anchor.get('net_margin', 0):.3f}",
+        f"{projection_anchor.get('current_pe', 0) if not pd.isna(projection_anchor.get('current_pe', np.nan)) else 0:.1f}",
+    ]
+    assumption_editor_key = "projection_assumptions_" + "_".join(default_key_parts)
+
     with st.expander("Edit scenario assumptions", expanded=False):
+        st.caption("Defaults recalculate whenever the ticker/current anchor changes. Editing is still allowed for manual what-if work.")
         assumptions = st.data_editor(
             assumptions_default,
+            key=assumption_editor_key,
             num_rows="fixed",
             use_container_width=True,
             column_config={
@@ -2285,12 +2392,14 @@ with tabs[6]:
 
     stat1, stat2, stat3, stat4 = st.columns(4)
     stat1.metric("Current Price", f"${current_price:,.2f}")
-    projection_anchor = get_projection_anchor(fundamentals, quote, base_revenue_b, shares_b, current_price)
     stat2.metric("2026 Revenue Base", f"${projection_anchor['revenue_b']:,.2f}B")
     stat3.metric("Current TTM EPS", f"${projection_anchor['eps']:,.2f}")
     stat4.metric("Projection Period", f"2027–{2026 + projection_years}")
 
-    matrices, proj_summary = build_projection_matrices(current_price, projection_anchor, projection_years, assumptions_default if 'assumptions' not in locals() else assumptions)
+    st.markdown("<div class='section-label'>Auto-Built Scenario Defaults</div>", unsafe_allow_html=True)
+    display_df(assumptions_default, style_rows=False)
+
+    matrices, proj_summary = build_projection_matrices(current_price, projection_anchor, projection_years, assumptions)
 
     if not proj_summary.empty:
         summary_fmt = proj_summary.copy()
@@ -2310,7 +2419,7 @@ with tabs[6]:
         if case_name in matrices:
             render_projection_case_table(case_name, matrices[case_name])
 
-    render_summary_box("Projection read", "The projection uses current fundamentals as the anchor, then gradually moves revenue growth, net margin, and terminal P/E toward the bear/base/bull assumptions. Share count is held flat to keep the model simple.")
+    render_summary_box("Projection read", "The projection uses current fundamentals as the anchor, then auto-builds bear/base/bull defaults from historical revenue growth, current margins, and current valuation. Share count is held flat to keep the model simple.")
     st.info("Tip: open Edit scenario assumptions to tune growth, margins, and valuation ranges.")
 
 with tabs[7]:

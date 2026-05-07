@@ -22,7 +22,7 @@ except Exception:
 
 
 st.set_page_config(
-    page_title="PLTR Financial Dashboard",
+    page_title="Financial Dashboard Builder",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -1464,7 +1464,7 @@ with st.sidebar:
     if st.button("Refresh live data"):
         st.cache_data.clear()
         st.rerun()
-    st.caption("PLTR uses the handcrafted dashboard. Any other ticker switches to a generic live dashboard using yfinance when available.")
+    st.caption("Work in Progress.")
 
 projection_years = 5
 base_revenue_b = 7.656

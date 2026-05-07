@@ -2082,6 +2082,222 @@ def build_business_mix_view(fundamentals: Dict[str, Any], market_data: Dict[str,
     return pd.DataFrame(rows), outlook
 
 
+def _fmt_ratio_value(value: Any, suffix: str = "x", decimals: int = 1) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    try:
+        v = float(value)
+        if abs(v) >= 100:
+            return f"{v:,.0f}{suffix}"
+        return f"{v:,.{decimals}f}{suffix}"
+    except Exception:
+        return "—"
+
+
+def _fmt_percent_value(value: Any, decimals: int = 1) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    try:
+        return f"{float(value) * 100:.{decimals}f}%"
+    except Exception:
+        return "—"
+
+
+def _latest_annual_value(fundamentals: Dict[str, Any], statement_key: str, possible_names: List[str]) -> float:
+    raw = fundamentals.get(statement_key, pd.DataFrame()) if isinstance(fundamentals, dict) else pd.DataFrame()
+    if raw is None or raw.empty:
+        return np.nan
+    cols = list(raw.columns)
+    try:
+        cols = sorted(cols, key=lambda c: pd.to_datetime(c), reverse=True)
+    except Exception:
+        pass
+    if not cols:
+        return np.nan
+    return _get_statement_value(raw, possible_names, cols[0])
+
+
+def build_ratio_dashboard(
+    fundamentals: Dict[str, Any],
+    quote: Dict[str, Any],
+    current_price: float,
+    market_cap_b: float,
+    shares_b: float,
+    revenue_base_b: float,
+    projection_anchor: Dict[str, float],
+) -> pd.DataFrame:
+    """Build a compact ratio dashboard with typical ranges and brief interpretation."""
+    income_q = fundamentals.get("income", pd.DataFrame()) if isinstance(fundamentals, dict) else pd.DataFrame()
+    balance_q = fundamentals.get("balance", pd.DataFrame()) if isinstance(fundamentals, dict) else pd.DataFrame()
+    cash_q = fundamentals.get("cashflow", pd.DataFrame()) if isinstance(fundamentals, dict) else pd.DataFrame()
+
+    ttm_revenue_b = float(projection_anchor.get("revenue_b", np.nan))
+    ttm_net_income_b = float(projection_anchor.get("net_income_b", np.nan))
+    ttm_eps = float(projection_anchor.get("eps", np.nan))
+    ttm_net_margin = float(projection_anchor.get("net_margin", np.nan))
+
+    ttm_fcf_raw = _ttm_sum(cash_q, ["Free Cash Flow"])
+    ttm_fcf_b = ttm_fcf_raw / 1_000_000_000 if not pd.isna(ttm_fcf_raw) else np.nan
+
+    latest_assets_raw = _latest_statement_value(balance_q, ["Total Assets"])
+    latest_equity_raw = _latest_statement_value(balance_q, ["Stockholders Equity", "Total Stockholder Equity", "Common Stock Equity"])
+    latest_debt_raw = _latest_statement_value(balance_q, ["Total Debt", "Long Term Debt And Capital Lease Obligation"])
+    latest_cash_raw = _latest_statement_value(balance_q, ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"])
+
+    assets_b = latest_assets_raw / 1_000_000_000 if not pd.isna(latest_assets_raw) else np.nan
+    equity_b = latest_equity_raw / 1_000_000_000 if not pd.isna(latest_equity_raw) else np.nan
+    debt_b = latest_debt_raw / 1_000_000_000 if not pd.isna(latest_debt_raw) else np.nan
+    cash_b = latest_cash_raw / 1_000_000_000 if not pd.isna(latest_cash_raw) else np.nan
+
+    annual_growth = _historical_revenue_cagr_from_fundamentals(fundamentals)
+    latest_growth = _recent_revenue_growth_from_fundamentals(fundamentals)
+    growth_for_peg = latest_growth if not pd.isna(latest_growth) else annual_growth
+
+    trailing_pe = quote.get("trailing_pe") if isinstance(quote, dict) else np.nan
+    forward_pe = quote.get("forward_pe") if isinstance(quote, dict) else np.nan
+    if trailing_pe is None or pd.isna(trailing_pe):
+        trailing_pe = safe_div(current_price, ttm_eps)
+
+    price_to_sales = safe_div(market_cap_b, ttm_revenue_b)
+    price_to_fcf = safe_div(market_cap_b, ttm_fcf_b)
+    price_to_book = safe_div(market_cap_b, equity_b)
+    ev_b = market_cap_b + (0 if pd.isna(debt_b) else debt_b) - (0 if pd.isna(cash_b) else cash_b)
+    ev_sales = safe_div(ev_b, ttm_revenue_b)
+    ev_fcf = safe_div(ev_b, ttm_fcf_b)
+    roe = safe_div(ttm_net_income_b, equity_b)
+    roa = safe_div(ttm_net_income_b, assets_b)
+    debt_to_equity = safe_div(debt_b, equity_b)
+    net_cash_b = (cash_b - debt_b) if not pd.isna(cash_b) and not pd.isna(debt_b) else np.nan
+    fcf_margin = safe_div(ttm_fcf_b, ttm_revenue_b)
+    earnings_yield = safe_div(1, trailing_pe)
+    fcf_yield = safe_div(ttm_fcf_b, market_cap_b)
+    peg = safe_div(trailing_pe, growth_for_peg * 100) if not pd.isna(growth_for_peg) and growth_for_peg > 0 else np.nan
+
+    rows = [
+        {
+            "Ratio": "P/E",
+            "Value": _fmt_ratio_value(trailing_pe),
+            "Typical Range": "10–25x mature; 25–50x growth",
+            "What It Means": "How much investors pay for each dollar of earnings. Higher means more growth is priced in.",
+        },
+        {
+            "Ratio": "Forward P/E",
+            "Value": _fmt_ratio_value(forward_pe),
+            "Typical Range": "10–25x mature; 25–45x growth",
+            "What It Means": "P/E using expected future earnings. Useful when earnings are moving quickly.",
+        },
+        {
+            "Ratio": "P/S",
+            "Value": _fmt_ratio_value(price_to_sales),
+            "Typical Range": "1–3x normal; 5–15x premium growth",
+            "What It Means": "Market cap divided by sales. Helpful when earnings are temporarily depressed or scaling.",
+        },
+        {
+            "Ratio": "PEG",
+            "Value": _fmt_ratio_value(peg),
+            "Typical Range": "<1 cheap vs growth; 1–2 fair; >2 expensive",
+            "What It Means": "P/E divided by growth rate. Tries to adjust valuation for growth.",
+        },
+        {
+            "Ratio": "EV/Sales",
+            "Value": _fmt_ratio_value(ev_sales),
+            "Typical Range": "1–4x normal; 6–15x premium growth",
+            "What It Means": "Enterprise value divided by sales. Adjusts market cap for cash and debt.",
+        },
+        {
+            "Ratio": "P/FCF",
+            "Value": _fmt_ratio_value(price_to_fcf),
+            "Typical Range": "10–25x normal; 25–50x growth",
+            "What It Means": "Market cap divided by free cash flow. Often cleaner than P/E for cash-generative companies.",
+        },
+        {
+            "Ratio": "EV/FCF",
+            "Value": _fmt_ratio_value(ev_fcf),
+            "Typical Range": "10–25x normal; 25–50x growth",
+            "What It Means": "Enterprise value divided by free cash flow. Penalizes debt and rewards cash.",
+        },
+        {
+            "Ratio": "P/B",
+            "Value": _fmt_ratio_value(price_to_book),
+            "Typical Range": "1–3x common; >5x asset-light/high ROE",
+            "What It Means": "Market cap divided by book equity. More useful for banks/asset-heavy firms than software.",
+        },
+        {
+            "Ratio": "Net Margin",
+            "Value": _fmt_percent_value(ttm_net_margin),
+            "Typical Range": "5–10% okay; 15–25% strong; >25% elite",
+            "What It Means": "Net income as a percentage of revenue. Shows bottom-line conversion.",
+        },
+        {
+            "Ratio": "FCF Margin",
+            "Value": _fmt_percent_value(fcf_margin),
+            "Typical Range": "5–10% okay; 15–25% strong; >25% elite",
+            "What It Means": "Free cash flow as a percentage of revenue. Shows cash conversion quality.",
+        },
+        {
+            "Ratio": "ROE",
+            "Value": _fmt_percent_value(roe),
+            "Typical Range": "10–15% good; >20% strong",
+            "What It Means": "Net income divided by equity. Measures return generated on shareholder capital.",
+        },
+        {
+            "Ratio": "ROA",
+            "Value": _fmt_percent_value(roa),
+            "Typical Range": "5–10% good; >10% strong",
+            "What It Means": "Net income divided by total assets. Useful for capital intensity comparisons.",
+        },
+        {
+            "Ratio": "Debt/Equity",
+            "Value": _fmt_ratio_value(debt_to_equity),
+            "Typical Range": "<0.5x conservative; 0.5–1.5x normal; >2x levered",
+            "What It Means": "Debt relative to equity. Higher leverage increases financial risk.",
+        },
+        {
+            "Ratio": "Net Cash / Debt",
+            "Value": f"${net_cash_b:,.2f}B" if not pd.isna(net_cash_b) else "—",
+            "Typical Range": "Positive is net cash; negative is net debt",
+            "What It Means": "Cash minus debt. Positive means the company has more cash than debt.",
+        },
+        {
+            "Ratio": "Earnings Yield",
+            "Value": _fmt_percent_value(earnings_yield),
+            "Typical Range": "4–8% common; higher may be cheaper/cyclical",
+            "What It Means": "Inverse of P/E. Shows earnings as a percentage of stock price.",
+        },
+        {
+            "Ratio": "FCF Yield",
+            "Value": _fmt_percent_value(fcf_yield),
+            "Typical Range": "3–6% okay; >6% attractive if durable",
+            "What It Means": "Free cash flow divided by market cap. A cash-return lens on valuation.",
+        },
+        {
+            "Ratio": "Revenue CAGR",
+            "Value": _fmt_percent_value(annual_growth),
+            "Typical Range": "0–5% slow; 5–15% solid; >20% high growth",
+            "What It Means": "Historical annualized revenue growth over available years.",
+        },
+        {
+            "Ratio": "Latest FY Growth",
+            "Value": _fmt_percent_value(latest_growth),
+            "Typical Range": "0–5% slow; 5–15% solid; >20% high growth",
+            "What It Means": "Latest fiscal year revenue growth versus the prior fiscal year.",
+        },
+    ]
+
+    return pd.DataFrame(rows)
+
+
+def make_ratio_summary(ratios: pd.DataFrame) -> str:
+    if ratios is None or ratios.empty:
+        return "No ratio data was available."
+    lookup = {str(r["Ratio"]): str(r["Value"]) for _, r in ratios.iterrows()}
+    return (
+        f"Key valuation snapshot: P/E {lookup.get('P/E', '—')}, P/S {lookup.get('P/S', '—')}, "
+        f"PEG {lookup.get('PEG', '—')}, P/FCF {lookup.get('P/FCF', '—')}. "
+        f"Quality snapshot: net margin {lookup.get('Net Margin', '—')}, FCF margin {lookup.get('FCF Margin', '—')}, "
+        f"ROE {lookup.get('ROE', '—')}."
+    )
+
 with st.sidebar:
     st.markdown("### Financial Dashboard Builder")
     ticker = st.text_input("Ticker", value=TICKER_DEFAULT).upper().strip() or TICKER_DEFAULT
@@ -2200,9 +2416,15 @@ with tabs[0]:
     val_cols[2].metric("P/S on Revenue Base", f"{market_cap_b / base_revenue_b:,.1f}x")
     val_cols[3].metric("Revenue Base", f"${base_revenue_b:,.2f}B")
     if is_live_generic:
-        st.info("This ticker is using generic live yfinance financials. For a fully bespoke dashboard, the segment/guidance/growth-history tabs need company-specific inputs.")
+        st.info("This ticker is using live yfinance financials where available. Some ratios may show blank if Yahoo does not return the required line item.")
     else:
-        st.warning("Valuation note: the fundamentals are exceptional, but the embedded expectations are also extreme. Use the Projection tab to stress-test bull/base/bear cases.")
+        st.warning("Valuation note: the embedded sample fundamentals are strong, but the embedded expectations are also high. Use the Projection tab to stress-test bull/base/bear cases.")
+
+    st.markdown("<div class='section-label'>Valuation, Profitability & Balance-Sheet Ratios</div>", unsafe_allow_html=True)
+    overview_anchor = get_projection_anchor(fundamentals, quote, base_revenue_b, shares_b, current_price)
+    ratio_df = build_ratio_dashboard(fundamentals, quote, current_price, market_cap_b, shares_b, base_revenue_b, overview_anchor)
+    render_summary_box("Ratio read", make_ratio_summary(ratio_df))
+    display_df(ratio_df, height=620, style_rows=False)
 
 with tabs[1]:
     st.markdown("<div class='section-label'>Income Statement</div>", unsafe_allow_html=True)

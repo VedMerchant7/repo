@@ -1704,13 +1704,43 @@ def _coerce_money_from_display(value: Any) -> float:
         return np.nan
 
 
-def _latest_numeric_from_table(df: pd.DataFrame, line_item_keywords: List[str]) -> float:
+def _latest_numeric_from_table(df: pd.DataFrame, line_item_keywords: List[str], exclude_keywords: Optional[List[str]] = None) -> float:
     if df is None or df.empty or "Line Item" not in df.columns:
         return np.nan
-    matches = df[df["Line Item"].astype(str).str.lower().apply(lambda x: any(k.lower() in x for k in line_item_keywords))]
+
+    exclude_keywords = exclude_keywords or []
+    labels = df["Line Item"].astype(str).str.lower().str.strip()
+
+    def is_match(label: str) -> bool:
+        if any(ex.lower() in label for ex in exclude_keywords):
+            return False
+        return any(k.lower() in label for k in line_item_keywords)
+
+    matches = df[labels.apply(is_match)]
     if matches.empty:
         return np.nan
-    row = matches.iloc[-1]
+
+    # Prefer the most direct revenue/profit line instead of accidentally taking cost-of-revenue.
+    preferred_order = [
+        "total revenue",
+        "revenue",
+        "gross profit",
+        "operating income",
+        "net income",
+        "free cash flow",
+        "operating cash flow",
+        "total assets",
+        "total debt",
+        "stockholders' equity",
+        "cash & equivalents",
+    ]
+    for preferred in preferred_order:
+        preferred_matches = matches[matches["Line Item"].astype(str).str.lower().str.strip() == preferred]
+        if not preferred_matches.empty:
+            matches = preferred_matches
+            break
+
+    row = matches.iloc[0]
     for col in reversed(list(df.columns)):
         if col in {"Line Item", "YoY Δ", "QoQ Δ", "Margin", "Status"}:
             continue
@@ -1734,7 +1764,7 @@ def _latest_percent_from_table(df: pd.DataFrame, line_item_keywords: List[str], 
 
 
 def make_income_summary(df: pd.DataFrame) -> str:
-    revenue = _latest_numeric_from_table(df, ["total revenue", "revenue"])
+    revenue = _latest_numeric_from_table(df, ["total revenue", "revenue"], exclude_keywords=["cost", "expense"])
     gross_margin = _latest_percent_from_table(df, ["gross profit"])
     op_margin = _latest_percent_from_table(df, ["operating income"])
     net_margin = _latest_percent_from_table(df, ["net income"])

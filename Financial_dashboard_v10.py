@@ -1242,6 +1242,148 @@ def build_live_statement_table(raw: pd.DataFrame, statement_type: str) -> pd.Dat
     return pd.DataFrame(rows)
 
 
+
+def build_live_statement_table_wide(fundamentals: Dict[str, Any], statement_type: str) -> pd.DataFrame:
+    """Build a wider statement view: annual history plus latest quarter."""
+    if statement_type == "income":
+        annual_raw = fundamentals.get("annual_income", pd.DataFrame())
+        quarter_raw = fundamentals.get("income", pd.DataFrame())
+        sections = [
+            ("REVENUE & PROFITABILITY", [
+                ("Total Revenue", ["Total Revenue", "Operating Revenue"], "money", "margin_base"),
+                ("Cost of Revenue", ["Cost Of Revenue", "Cost Revenue"], "money", None),
+                ("Gross Profit", ["Gross Profit"], "money", "gross_margin"),
+            ]),
+            ("OPERATING RESULTS", [
+                ("Operating Expense", ["Operating Expense", "Total Operating Expenses"], "money", None),
+                ("Operating Income", ["Operating Income"], "money", "op_margin"),
+                ("EBITDA", ["EBITDA", "Normalized EBITDA"], "money", "ebitda_margin"),
+            ]),
+            ("NET INCOME & EPS", [
+                ("Pretax Income", ["Pretax Income"], "money", None),
+                ("Tax Provision", ["Tax Provision"], "money", None),
+                ("Net Income", ["Net Income", "Net Income Common Stockholders"], "money", "net_margin"),
+                ("Diluted EPS", ["Diluted EPS", "Diluted EPS Diluted"], "eps", None),
+            ]),
+        ]
+    elif statement_type == "balance":
+        annual_raw = fundamentals.get("annual_balance", pd.DataFrame())
+        quarter_raw = fundamentals.get("balance", pd.DataFrame())
+        sections = [
+            ("ASSETS", [
+                ("Cash & Equivalents", ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"], "money", None),
+                ("Accounts Receivable", ["Accounts Receivable", "Receivables"], "money", None),
+                ("Current Assets", ["Current Assets", "Total Current Assets"], "money", None),
+                ("Total Assets", ["Total Assets"], "money", None),
+            ]),
+            ("LIABILITIES", [
+                ("Current Liabilities", ["Current Liabilities", "Total Current Liabilities"], "money", None),
+                ("Total Debt", ["Total Debt", "Long Term Debt And Capital Lease Obligation"], "money", None),
+                ("Total Liabilities", ["Total Liabilities Net Minority Interest", "Total Liab"], "money", None),
+            ]),
+            ("EQUITY", [
+                ("Stockholders' Equity", ["Stockholders Equity", "Total Stockholder Equity"], "money", None),
+                ("Common Stock Equity", ["Common Stock Equity"], "money", None),
+            ]),
+        ]
+    else:
+        annual_raw = fundamentals.get("annual_cashflow", pd.DataFrame())
+        quarter_raw = fundamentals.get("cashflow", pd.DataFrame())
+        sections = [
+            ("OPERATING CASH FLOW", [
+                ("Operating Cash Flow", ["Operating Cash Flow", "Total Cash From Operating Activities"], "money", None),
+                ("Capital Expenditure", ["Capital Expenditure", "Capital Expenditures"], "money", None),
+                ("Free Cash Flow", ["Free Cash Flow"], "money", None),
+            ]),
+            ("INVESTING & FINANCING", [
+                ("Investing Cash Flow", ["Investing Cash Flow", "Total Cashflows From Investing Activities"], "money", None),
+                ("Financing Cash Flow", ["Financing Cash Flow", "Total Cash From Financing Activities"], "money", None),
+                ("Stock Repurchase", ["Repurchase Of Capital Stock", "Repurchase Of Stock"], "money", None),
+                ("Dividends Paid", ["Cash Dividends Paid", "Common Stock Dividend Paid"], "money", None),
+            ]),
+            ("CASH POSITION", [
+                ("Beginning Cash Position", ["Beginning Cash Position"], "money", None),
+                ("End Cash Position", ["End Cash Position"], "money", None),
+            ]),
+        ]
+
+    annual_cols = []
+    if isinstance(annual_raw, pd.DataFrame) and not annual_raw.empty:
+        annual_cols = list(annual_raw.columns)
+        try:
+            annual_cols = sorted(annual_cols, key=lambda c: pd.to_datetime(c))
+        except Exception:
+            pass
+        annual_cols = annual_cols[-6:]
+
+    q_cols = []
+    if isinstance(quarter_raw, pd.DataFrame) and not quarter_raw.empty:
+        q_cols = list(quarter_raw.columns)
+        try:
+            q_cols = sorted(q_cols, key=lambda c: pd.to_datetime(c), reverse=True)
+        except Exception:
+            pass
+
+    latest_q = q_cols[0] if q_cols else None
+    prior_q = q_cols[1] if len(q_cols) > 1 else None
+    prior_y_q = q_cols[4] if len(q_cols) > 4 else None
+
+    if not annual_cols and latest_q is None:
+        return pd.DataFrame({"Line Item": ["NO LIVE STATEMENT DATA RETURNED"], "Status": ["Check ticker, internet connection, or yfinance availability"]})
+
+    annual_labels = []
+    for c in annual_cols:
+        try:
+            annual_labels.append(f"FY{pd.to_datetime(c).year}")
+        except Exception:
+            annual_labels.append(str(c))
+
+    q_label = "Latest Qtr"
+    if latest_q is not None:
+        try:
+            q_label = pd.to_datetime(latest_q).strftime("%b %Y")
+        except Exception:
+            q_label = str(latest_q)
+
+    display_cols = annual_labels + ([q_label] if latest_q is not None else [])
+    rows: List[Dict[str, Any]] = []
+
+    def revenue_value(raw_df: pd.DataFrame, col: Any) -> float:
+        return _get_statement_value(raw_df, ["Total Revenue", "Operating Revenue"], col)
+
+    def margin_for(metric_tag: Optional[str], raw_df: pd.DataFrame, col: Any, value: float) -> str:
+        if metric_tag is None or raw_df is None or raw_df.empty or col is None:
+            return "—"
+        rev = revenue_value(raw_df, col)
+        if pd.isna(value) or pd.isna(rev) or rev == 0:
+            return "—"
+        return f"{safe_div(value, rev) * 100:.1f}%"
+
+    for section_name, items in sections:
+        rows.append({"Line Item": section_name, **{c: "" for c in display_cols}, "YoY Δ": "", "QoQ Δ": "", "Margin": ""})
+        for label, possible, kind, metric_tag in items:
+            annual_vals = [_get_statement_value(annual_raw, possible, c) for c in annual_cols] if annual_cols else []
+            q_val = _get_statement_value(quarter_raw, possible, latest_q) if latest_q is not None else np.nan
+
+            if all(pd.isna(v) for v in annual_vals) and pd.isna(q_val):
+                continue
+
+            row = {"Line Item": label}
+            for col_label, val in zip(annual_labels, annual_vals):
+                row[col_label] = _fmt_raw_number(val, kind)
+            if latest_q is not None:
+                row[q_label] = _fmt_raw_number(q_val, kind)
+
+            prior_y_val = _get_statement_value(quarter_raw, possible, prior_y_q) if prior_y_q is not None else np.nan
+            prior_q_val = _get_statement_value(quarter_raw, possible, prior_q) if prior_q is not None else np.nan
+            row["YoY Δ"] = _pct_change(q_val, prior_y_val)
+            row["QoQ Δ"] = _pct_change(q_val, prior_q_val)
+            row["Margin"] = margin_for(metric_tag, quarter_raw, latest_q, q_val)
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
 def build_live_kpis(fundamentals: Dict[str, Any], quote: Dict[str, Any], market_cap_b: float) -> List[Tuple[str, str, str]]:
     income = fundamentals.get("income", pd.DataFrame())
     cashflow = fundamentals.get("cashflow", pd.DataFrame())
@@ -1464,7 +1606,7 @@ with st.sidebar:
     if st.button("Refresh live data"):
         st.cache_data.clear()
         st.rerun()
-    st.caption("Work in Progress.")
+    st.caption("Work in progress...")
 
 projection_years = 5
 base_revenue_b = 7.656
@@ -1581,7 +1723,7 @@ with tabs[0]:
 with tabs[1]:
     st.markdown("<div class='section-label'>Income Statement</div>", unsafe_allow_html=True)
     if is_live_generic:
-        df_income = build_live_statement_table(fundamentals.get("income", pd.DataFrame()), "income")
+        df_income = build_live_statement_table_wide(fundamentals, "income")
         render_financial_table(df_income)
         st.caption("Live generic income statement from yfinance. Line-item names vary by company and Yahoo availability.")
     else:
@@ -1597,7 +1739,7 @@ with tabs[1]:
 with tabs[2]:
     st.markdown("<div class='section-label'>Balance Sheet</div>", unsafe_allow_html=True)
     if is_live_generic:
-        df_balance = build_live_statement_table(fundamentals.get("balance", pd.DataFrame()), "balance")
+        df_balance = build_live_statement_table_wide(fundamentals, "balance")
         render_financial_table(df_balance)
         st.caption("Live generic balance sheet from yfinance. Line-item availability varies by company.")
     else:
@@ -1611,7 +1753,7 @@ with tabs[2]:
 with tabs[3]:
     st.markdown("<div class='section-label'>Cash Flow</div>", unsafe_allow_html=True)
     if is_live_generic:
-        df_cash = build_live_statement_table(fundamentals.get("cashflow", pd.DataFrame()), "cashflow")
+        df_cash = build_live_statement_table_wide(fundamentals, "cashflow")
         render_financial_table(df_cash)
         st.caption("Live generic cash-flow statement from yfinance. Line-item availability varies by company.")
     else:
@@ -1635,9 +1777,12 @@ with tabs[4]:
 
         annual_live = build_live_annual_metrics(fundamentals)
         if not annual_live.empty and "Revenue" in annual_live.columns:
-            fig = px.bar(annual_live, x="Year", y="Revenue", title=f"{ticker} Annual Revenue Trend", text_auto=True)
-            fig.update_layout(template="plotly_dark", height=390)
-            st.plotly_chart(fig, use_container_width=True)
+            chart_annual = annual_live.copy()
+            if "Revenue" in chart_annual.columns:
+                chart_annual["Revenue ($B)"] = chart_annual["Revenue"] / 1000
+                fig = px.bar(chart_annual, x="Year", y="Revenue ($B)", title=f"{ticker} Annual Revenue Trend", text_auto=".2f")
+                fig.update_layout(template="plotly_dark", height=390, yaxis_title="USD Billions")
+                st.plotly_chart(fig, use_container_width=True)
 
         rec_sum = market_data.get("recommendation_summary", pd.DataFrame()) if use_live else pd.DataFrame()
         if isinstance(rec_sum, pd.DataFrame) and not rec_sum.empty:
@@ -1669,8 +1814,11 @@ with tabs[5]:
             st.info("No annual financial history returned for this ticker.")
         else:
             metric = st.selectbox("Chart metric", ["Revenue", "Gross Profit", "Operating Income", "Net Income", "Free Cash Flow"])
-            fig = px.bar(live_annual, x="Year", y=metric, title=f"{ticker} {metric} History", text_auto=True)
-            fig.update_layout(template="plotly_dark", height=430)
+            chart_df = live_annual.copy()
+            chart_metric = f"{metric} ($B)"
+            chart_df[chart_metric] = chart_df[metric] / 1000
+            fig = px.bar(chart_df, x="Year", y=chart_metric, title=f"{ticker} {metric} History", text_auto=".2f")
+            fig.update_layout(template="plotly_dark", height=430, yaxis_title="USD Billions")
             st.plotly_chart(fig, use_container_width=True)
 
             margin_cols = [c for c in ["Gross Margin %", "Operating Margin %", "Net Margin %"] if c in live_annual.columns]
@@ -1683,7 +1831,7 @@ with tabs[5]:
             live_display = live_annual.copy()
             for col in ["Revenue", "Gross Profit", "Operating Income", "Net Income", "Free Cash Flow"]:
                 if col in live_display.columns:
-                    live_display[col] = live_display[col].map(lambda x: fmt_money_m(x) if not pd.isna(x) else "—")
+                    live_display[col] = live_display[col].map(lambda x: f"${x/1000:,.2f}B" if not pd.isna(x) else "—")
             for col in ["Gross Margin %", "Operating Margin %", "Net Margin %"]:
                 if col in live_display.columns:
                     live_display[col] = live_display[col].map(lambda x: f"{x:.1f}%" if not pd.isna(x) else "—")
@@ -1702,8 +1850,11 @@ with tabs[5]:
             col.metric(label, f"{calc_cagr(start, end, 4)*100:.1f}%", f"{fmt_money_m(start)} → {fmt_money_m(end)}")
 
         metric = st.selectbox("Chart metric", ["Revenue", "Gross Profit", "Adj. Op. Income", "Adj. FCF", "GAAP Net Income"])
-        fig = px.bar(annual_metrics, x="Year", y=metric, title=f"{metric} History", text_auto=True)
-        fig.update_layout(template="plotly_dark", height=430)
+        chart_metrics = annual_metrics.copy()
+        chart_col = f"{metric} ($B)"
+        chart_metrics[chart_col] = chart_metrics[metric] / 1000
+        fig = px.bar(chart_metrics, x="Year", y=chart_col, title=f"{metric} History", text_auto=".2f")
+        fig.update_layout(template="plotly_dark", height=430, yaxis_title="USD Billions")
         st.plotly_chart(fig, use_container_width=True)
 
         margin_df = annual_metrics[["Year", "Revenue Growth %", "Adj. Op Margin %", "FCF Margin %"]].melt("Year", var_name="Metric", value_name="Percent")
@@ -1813,9 +1964,9 @@ with tabs[8]:
     st.markdown("<div class='section-label'>Export Dashboard Data</div>", unsafe_allow_html=True)
     if is_live_generic:
         export_tables = {
-            "live_income_statement": build_live_statement_table(fundamentals.get("income", pd.DataFrame()), "income"),
-            "live_balance_sheet": build_live_statement_table(fundamentals.get("balance", pd.DataFrame()), "balance"),
-            "live_cash_flow": build_live_statement_table(fundamentals.get("cashflow", pd.DataFrame()), "cashflow"),
+            "live_income_statement": build_live_statement_table_wide(fundamentals, "income"),
+            "live_balance_sheet": build_live_statement_table_wide(fundamentals, "balance"),
+            "live_cash_flow": build_live_statement_table_wide(fundamentals, "cashflow"),
             "live_operating_profile": build_live_operating_profile(fundamentals),
             "live_forward_view": build_live_forward_view(market_data, quote, current_price, market_cap_b, base_revenue_b),
             "live_annual_metrics": build_live_annual_metrics(fundamentals),

@@ -1,4 +1,4 @@
-"""Offline financial dashboard with optional live yfinance data."""
+"""Financial Dashboard Builder: local/hosted equity research dashboard."""
 
 from __future__ import annotations
 
@@ -18,6 +18,13 @@ try:
     import yfinance as yf
 except Exception:
     yf = None
+
+try:
+    import requests
+    from bs4 import BeautifulSoup
+except Exception:
+    requests = None
+    BeautifulSoup = None
 
 
 
@@ -681,12 +688,10 @@ def get_market_data(ticker: str) -> Dict[str, Any]:
 
     return result
 
-# Embedded dashboard data
-# Values are USD millions unless noted.
 
 TICKER_DEFAULT = "PLTR"
-COMPANY_NAME = "Palantir Technologies"
-REPORT_DATE = "Q1 2026 Earnings · May 4, 2026 · USD millions unless noted"
+COMPANY_NAME = "Selected Company"
+REPORT_DATE = "Financial Dashboard Builder · USD unless noted"
 
 KPI_DATA = [
     ("Revenue Q1'26", "$1,633M", "+84.7% YoY"),
@@ -817,8 +822,6 @@ GUIDANCE = pd.DataFrame(
     columns=["Metric", "Guidance", "Commentary"],
 )
 
-# Data builders
-
 def statement_df(rows: List[Tuple], include_margins: bool = True) -> pd.DataFrame:
     out = []
     total_rev_q1_25 = 884
@@ -866,7 +869,6 @@ def get_default_projection_assumptions(current_price: float) -> pd.DataFrame:
                 "Case": "Base",
                 "Revenue Growth %": 18.0,
                 "Terminal Net Margin %": 28.0,
-                "Dilution CAGR %": 1.0,
                 "Terminal PE Low": 28.0,
                 "Terminal PE High": 38.0,
             },
@@ -874,7 +876,6 @@ def get_default_projection_assumptions(current_price: float) -> pd.DataFrame:
                 "Case": "Bull",
                 "Revenue Growth %": 28.0,
                 "Terminal Net Margin %": 34.0,
-                "Dilution CAGR %": 0.5,
                 "Terminal PE Low": 40.0,
                 "Terminal PE High": 55.0,
             },
@@ -882,13 +883,11 @@ def get_default_projection_assumptions(current_price: float) -> pd.DataFrame:
                 "Case": "Bear",
                 "Revenue Growth %": 8.0,
                 "Terminal Net Margin %": 18.0,
-                "Dilution CAGR %": 1.5,
                 "Terminal PE Low": 16.0,
                 "Terminal PE High": 24.0,
             },
         ]
     )
-
 
 
 def _ttm_sum(raw: pd.DataFrame, possible_names: List[str]) -> float:
@@ -993,7 +992,6 @@ def build_projection_matrices(
         case = str(r["Case"]).strip() or "Case"
         rev_growth = float(r["Revenue Growth %"]) / 100.0
         terminal_margin = float(r["Terminal Net Margin %"]) / 100.0
-        dilution = float(r["Dilution CAGR %"]) / 100.0
         terminal_pe_low = float(r["Terminal PE Low"])
         terminal_pe_high = float(r["Terminal PE High"])
 
@@ -1018,7 +1016,7 @@ def build_projection_matrices(
         for step in range(1, years + 1):
             revenue_i = previous_revenue * (1 + rev_growth)
             margin_i = _attenuate(base_margin, terminal_margin, step, years)
-            shares_i = base_shares_b * ((1 + dilution) ** step)
+            shares_i = base_shares_b
             net_income_i = revenue_i * margin_i
             eps_i = net_income_i / shares_i if shares_i else np.nan
 
@@ -1686,14 +1684,207 @@ def build_live_forward_view(market_data: Dict[str, Any], quote: Dict[str, Any], 
 
 
 
+def _coerce_money_from_display(value: Any) -> float:
+    if value is None or pd.isna(value):
+        return np.nan
+    s = str(value).replace("$", "").replace(",", "").replace("(", "-").replace(")", "").strip()
+    if s in {"", "—", "-"}:
+        return np.nan
+    mult = 1.0
+    upper = s.upper()
+    if upper.endswith("B"):
+        mult = 1000.0
+        s = s[:-1]
+    elif upper.endswith("M"):
+        mult = 1.0
+        s = s[:-1]
+    try:
+        return float(s) * mult
+    except Exception:
+        return np.nan
+
+
+def _latest_numeric_from_table(df: pd.DataFrame, line_item_keywords: List[str]) -> float:
+    if df is None or df.empty or "Line Item" not in df.columns:
+        return np.nan
+    matches = df[df["Line Item"].astype(str).str.lower().apply(lambda x: any(k.lower() in x for k in line_item_keywords))]
+    if matches.empty:
+        return np.nan
+    row = matches.iloc[-1]
+    for col in reversed(list(df.columns)):
+        if col in {"Line Item", "YoY Δ", "QoQ Δ", "Margin", "Status"}:
+            continue
+        val = _coerce_money_from_display(row.get(col))
+        if not pd.isna(val):
+            return val
+    return np.nan
+
+
+def _latest_percent_from_table(df: pd.DataFrame, line_item_keywords: List[str], col_name: str = "Margin") -> float:
+    if df is None or df.empty or "Line Item" not in df.columns or col_name not in df.columns:
+        return np.nan
+    matches = df[df["Line Item"].astype(str).str.lower().apply(lambda x: any(k.lower() in x for k in line_item_keywords))]
+    if matches.empty:
+        return np.nan
+    s = str(matches.iloc[-1].get(col_name, "")).replace("%", "").replace("+", "").strip()
+    try:
+        return float(s)
+    except Exception:
+        return np.nan
+
+
+def make_income_summary(df: pd.DataFrame) -> str:
+    revenue = _latest_numeric_from_table(df, ["total revenue", "revenue"])
+    gross_margin = _latest_percent_from_table(df, ["gross profit"])
+    op_margin = _latest_percent_from_table(df, ["operating income"])
+    net_margin = _latest_percent_from_table(df, ["net income"])
+    parts = []
+    if not pd.isna(revenue):
+        parts.append(f"Latest revenue shown is about ${revenue/1000:,.2f}B.")
+    if not pd.isna(gross_margin):
+        parts.append(f"Gross margin is {gross_margin:.1f}%, which frames the quality of the business model.")
+    if not pd.isna(op_margin):
+        parts.append(f"Operating margin is {op_margin:.1f}%, showing current operating leverage.")
+    if not pd.isna(net_margin):
+        parts.append(f"Net margin is {net_margin:.1f}%, the cleanest quick read on bottom-line conversion.")
+    return " ".join(parts) if parts else "I could not calculate a clean income-statement read from the available rows."
+
+
+def make_balance_summary(df: pd.DataFrame) -> str:
+    cash = _latest_numeric_from_table(df, ["cash", "cash & equivalents"])
+    debt = _latest_numeric_from_table(df, ["total debt"])
+    assets = _latest_numeric_from_table(df, ["total assets"])
+    equity = _latest_numeric_from_table(df, ["equity"])
+    parts = []
+    if not pd.isna(cash):
+        parts.append(f"Cash and equivalents are about ${cash/1000:,.2f}B.")
+    if not pd.isna(debt):
+        parts.append(f"Total debt is about ${debt/1000:,.2f}B.")
+    if not pd.isna(cash) and not pd.isna(debt):
+        parts.append(f"Net cash/debt position is roughly ${(cash-debt)/1000:,.2f}B.")
+    if not pd.isna(assets) and not pd.isna(equity) and assets:
+        parts.append(f"Equity represents about {equity/assets*100:.1f}% of total assets.")
+    return " ".join(parts) if parts else "I could not calculate a clean balance-sheet read from the available rows."
+
+
+def make_cashflow_summary(df: pd.DataFrame) -> str:
+    ocf = _latest_numeric_from_table(df, ["operating cash flow"])
+    capex = _latest_numeric_from_table(df, ["capital expenditure"])
+    fcf = _latest_numeric_from_table(df, ["free cash flow"])
+    parts = []
+    if not pd.isna(ocf):
+        parts.append(f"Operating cash flow is about ${ocf/1000:,.2f}B.")
+    if not pd.isna(capex):
+        parts.append(f"Capex is about ${capex/1000:,.2f}B.")
+    if not pd.isna(fcf):
+        parts.append(f"Free cash flow is about ${fcf/1000:,.2f}B.")
+    if not pd.isna(ocf) and not pd.isna(fcf) and ocf:
+        parts.append(f"FCF conversion from operating cash flow is roughly {fcf/ocf*100:.1f}%.")
+    return " ".join(parts) if parts else "I could not calculate a clean cash-flow read from the available rows."
+
+
+def make_growth_summary(df: pd.DataFrame) -> str:
+    if df is None or df.empty or "Revenue" not in df.columns:
+        return "No annual financial history was returned for this ticker."
+    clean = df.dropna(subset=["Revenue"]).copy()
+    if len(clean) < 2:
+        return "Not enough annual revenue history to judge the growth trend."
+    start = float(clean["Revenue"].iloc[0])
+    end = float(clean["Revenue"].iloc[-1])
+    periods = max(len(clean) - 1, 1)
+    cagr = calc_cagr(start, end, periods) * 100 if start > 0 and end > 0 else np.nan
+    margin_note = ""
+    if "Net Margin %" in clean.columns and not clean["Net Margin %"].dropna().empty:
+        margin_note = f" Latest net margin is {clean['Net Margin %'].dropna().iloc[-1]:.1f}%."
+    return f"Revenue moved from ${start/1000:,.2f}B to ${end/1000:,.2f}B over the available annual period, implying about {cagr:.1f}% CAGR.{margin_note}"
+
+
+def render_summary_box(title: str, text_value: str) -> None:
+    st.markdown(
+        f"""
+<div class="card">
+  <div style="font-weight:800;color:#a29bfe;letter-spacing:.08em;text-transform:uppercase;font-size:.78rem;margin-bottom:6px">{_html_escape(title)}</div>
+  <div style="color:#e8e8f2;line-height:1.65">{_html_escape(text_value)}</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def fetch_outlook_from_web(ticker: str, company_name: str) -> pd.DataFrame:
+    if requests is None or BeautifulSoup is None:
+        return pd.DataFrame([{"Source": "Unavailable", "Outlook Item": "requests/beautifulsoup are not installed.", "URL": ""}])
+
+    query = f"{ticker} {company_name} latest earnings call transcript outlook guidance segments"
+    headers = {"User-Agent": "Mozilla/5.0 FinancialDashboardBuilder/1.0"}
+    rows = []
+
+    try:
+        r = requests.get("https://duckduckgo.com/html/", params={"q": query}, headers=headers, timeout=12)
+        soup = BeautifulSoup(r.text, "html.parser")
+        links = []
+        for a in soup.select("a.result__a")[:6]:
+            href = a.get("href", "")
+            title = a.get_text(" ", strip=True)
+            if href:
+                links.append((title, href))
+
+        keywords = ["outlook", "guidance", "segment", "segments", "revenue", "demand", "margin", "growth", "earnings call", "transcript"]
+        for title, url in links[:4]:
+            try:
+                page = requests.get(url, headers=headers, timeout=12)
+                page_soup = BeautifulSoup(page.text, "html.parser")
+                text_blob = " ".join(p.get_text(" ", strip=True) for p in page_soup.find_all(["p", "li"])[:160])
+                sentences = re.split(r"(?<=[.!?])\s+", text_blob)
+                picked = []
+                for s in sentences:
+                    lower = s.lower()
+                    if len(s) > 70 and any(k in lower for k in keywords):
+                        picked.append(s[:450])
+                    if len(picked) >= 4:
+                        break
+                if picked:
+                    rows.append({"Source": title[:90], "Outlook Item": " ".join(picked), "URL": url})
+            except Exception:
+                continue
+            if len(rows) >= 4:
+                break
+    except Exception as e:
+        rows.append({"Source": "Web fetch failed", "Outlook Item": str(e), "URL": ""})
+
+    if not rows:
+        rows.append({"Source": "No transcript/outlook result found", "Outlook Item": "No clean public earnings-call or outlook text was found from the web search. Financial tables still use yfinance data.", "URL": ""})
+    return pd.DataFrame(rows)
+
+
+def build_business_mix_view(fundamentals: Dict[str, Any], market_data: Dict[str, Any], ticker: str, company_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    annual = build_live_annual_metrics(fundamentals)
+    rows = []
+    if not annual.empty and "Revenue" in annual.columns:
+        clean = annual.dropna(subset=["Revenue"]).copy()
+        if len(clean) >= 2:
+            latest = clean.iloc[-1]
+            prev = clean.iloc[-2]
+            growth = safe_div(latest["Revenue"], prev["Revenue"]) - 1 if prev["Revenue"] else np.nan
+            rows.append({"Metric": "Annual Revenue Growth", "Value": f"{growth*100:.1f}%" if not pd.isna(growth) else "—", "Read": "Latest fiscal year versus prior fiscal year"})
+            for col in ["Gross Margin %", "Operating Margin %", "Net Margin %"]:
+                if col in latest and not pd.isna(latest.get(col, np.nan)):
+                    rows.append({"Metric": col.replace(" %", ""), "Value": f"{latest.get(col):.1f}%", "Read": "Latest fiscal year"})
+    if not rows:
+        rows.append({"Metric": "Business Mix", "Value": "—", "Read": "Segment-level revenue is not consistently available from free yfinance data."})
+    outlook = fetch_outlook_from_web(ticker, company_name)
+    return pd.DataFrame(rows), outlook
+
+
 with st.sidebar:
-    st.markdown("### Dashboard Controls")
+    st.markdown("### Financial Dashboard Builder")
     ticker = st.text_input("Ticker", value=TICKER_DEFAULT).upper().strip() or TICKER_DEFAULT
     use_live = st.toggle("Use internet data when available", value=True)
     if st.button("Refresh live data"):
         st.cache_data.clear()
         st.rerun()
-    st.caption("Work in progress...")
+    st.caption("Default ticker uses embedded sample data. Any other ticker switches to a generic live dashboard using yfinance when available.")
 
 projection_years = 5
 base_revenue_b = 7.656
@@ -1712,6 +1903,9 @@ if is_live_generic:
     base_revenue_b = compute_start_revenue_from_live(fundamentals, base_revenue_b)
 
 
+
+st.markdown("<h1 style='margin-bottom:0.1rem'>Financial Dashboard Builder</h1>", unsafe_allow_html=True)
+st.caption("Build a clean financial dashboard from a ticker, with statements, valuation context, projections, and live outlook notes.")
 
 col_left, col_right = st.columns([0.7, 0.3])
 with col_left:
@@ -1732,7 +1926,7 @@ for col, (label, value, delta) in zip(kpi_cols, display_kpis):
         st.metric(label, value, delta)
 
 if is_live_generic:
-    mode_title = "Live Generic Mode" if use_live else "Generic Ticker Mode"
+    mode_title = "Live Company Dashboard" if use_live else "Ticker Dashboard"
     mode_detail = (
         f"Financial statement data is being pulled for {ticker} from yfinance. Generic statement, trend, forward-view, and projection sections update for the selected ticker."
         if use_live
@@ -1759,8 +1953,6 @@ else:
 """,
         unsafe_allow_html=True,
     )
-
-# Tabs
 
 tabs = st.tabs([
     "Overview",
@@ -1811,10 +2003,12 @@ with tabs[1]:
     st.markdown("<div class='section-label'>Income Statement</div>", unsafe_allow_html=True)
     if is_live_generic:
         df_income = build_live_statement_table_wide(fundamentals, "income")
+        render_summary_box("Income statement read", make_income_summary(df_income))
         render_financial_table(df_income)
-        st.caption("Live generic income statement from yfinance. Line-item names vary by company and Yahoo availability.")
+        st.caption("Live income statement from yfinance. Line-item names vary by company and Yahoo availability.")
     else:
         df_income = statement_df(income_rows, include_margins=True)
+        render_summary_box("Income statement read", make_income_summary(df_income))
         render_financial_table(df_income)
 
         chart_df = pd.DataFrame({"Metric": ["Revenue", "Gross Profit", "GAAP Operating Income", "GAAP Net Income"], "Q1 2025": [884, 711, 176, 214], "Q1 2026": [1633, 1417, 754, 871]})
@@ -1827,10 +2021,12 @@ with tabs[2]:
     st.markdown("<div class='section-label'>Balance Sheet</div>", unsafe_allow_html=True)
     if is_live_generic:
         df_balance = build_live_statement_table_wide(fundamentals, "balance")
+        render_summary_box("Balance sheet read", make_balance_summary(df_balance))
         render_financial_table(df_balance)
-        st.caption("Live generic balance sheet from yfinance. Line-item availability varies by company.")
+        st.caption("Live balance sheet from yfinance. Line-item availability varies by company.")
     else:
         df_balance = simple_statement_df(balance_rows)
+        render_summary_box("Balance sheet read", make_balance_summary(df_balance))
         render_financial_table(df_balance)
         bs_chart = pd.DataFrame({"Metric": ["Assets", "Liabilities", "Equity", "Cash + Treasuries"], "Q1 2026": [9312, 1640, 8672, 8000]})
         fig = px.bar(bs_chart, x="Metric", y="Q1 2026", title="Q1 2026 Balance Sheet Snapshot", text_auto=True)
@@ -1841,10 +2037,12 @@ with tabs[3]:
     st.markdown("<div class='section-label'>Cash Flow</div>", unsafe_allow_html=True)
     if is_live_generic:
         df_cash = build_live_statement_table_wide(fundamentals, "cashflow")
+        render_summary_box("Cash-flow read", make_cashflow_summary(df_cash))
         render_financial_table(df_cash)
-        st.caption("Live generic cash-flow statement from yfinance. Line-item availability varies by company.")
+        st.caption("Live cash-flow statement from yfinance. Line-item availability varies by company.")
     else:
         df_cash = simple_statement_df(cash_rows)
+        render_summary_box("Cash-flow read", make_cashflow_summary(df_cash))
         render_financial_table(df_cash)
         cf_chart = pd.DataFrame({"Metric": ["Net Cash from Ops", "GAAP FCF", "Adjusted FCF"], "Q1 2025": [310, 304, 373], "Q1 2026": [899, 892, 925]})
         melted = cf_chart.melt(id_vars="Metric", var_name="Period", value_name="USD Millions")
@@ -1854,34 +2052,38 @@ with tabs[3]:
 
 with tabs[4]:
     if is_live_generic:
-        st.markdown("<div class='section-label'>Operating Profile</div>", unsafe_allow_html=True)
-        profile = build_live_operating_profile(fundamentals)
-        render_financial_table(profile)
-
-        st.markdown("<div class='section-label'>Forward View</div>", unsafe_allow_html=True)
-        forward_view = build_live_forward_view(market_data, quote, current_price, market_cap_b, base_revenue_b)
-        display_df(forward_view, style_rows=False)
+        st.markdown("<div class='section-label'>Business Mix & Outlook</div>", unsafe_allow_html=True)
+        mix_view, outlook_view = build_business_mix_view(fundamentals, market_data, ticker, long_name)
+        render_summary_box("Outlook read", "This page combines available growth/margin data with a best-effort web pull for recent earnings-call, transcript, guidance, and outlook language.")
+        display_df(mix_view, style_rows=False)
 
         annual_live = build_live_annual_metrics(fundamentals)
         if not annual_live.empty and "Revenue" in annual_live.columns:
             chart_annual = annual_live.copy()
-            if "Revenue" in chart_annual.columns:
-                chart_annual["Revenue ($B)"] = chart_annual["Revenue"] / 1000
-                fig = px.bar(chart_annual, x="Year", y="Revenue ($B)", title=f"{ticker} Annual Revenue Trend", text_auto=".2f")
-                fig.update_layout(template="plotly_dark", height=390, yaxis_title="USD Billions")
-                st.plotly_chart(fig, use_container_width=True)
+            chart_annual["Revenue ($B)"] = chart_annual["Revenue"] / 1000
+            fig = px.bar(chart_annual, x="Year", y="Revenue ($B)", title=f"{ticker} Annual Revenue Trend", text_auto=".2f")
+            fig.update_layout(template="plotly_dark", height=390, yaxis_title="USD Billions")
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("<div class='section-label'>Latest Earnings Call / Outlook Notes</div>", unsafe_allow_html=True)
+        display_df(outlook_view, style_rows=False)
+
+        st.markdown("<div class='section-label'>Forward View</div>", unsafe_allow_html=True)
+        forward_view = build_live_forward_view(market_data, quote, current_price, market_cap_b, base_revenue_b)
+        display_df(forward_view, style_rows=False)
 
         rec_sum = market_data.get("recommendation_summary", pd.DataFrame()) if use_live else pd.DataFrame()
         if isinstance(rec_sum, pd.DataFrame) and not rec_sum.empty:
             st.markdown("<div class='section-label'>Analyst Recommendation Trend</div>", unsafe_allow_html=True)
             display_df(rec_sum, height=260, style_rows=False)
     else:
-        st.markdown("<div class='section-label'>Segment Revenue</div>", unsafe_allow_html=True)
+        st.markdown("<div class='section-label'>Business Mix & Outlook</div>", unsafe_allow_html=True)
+        render_summary_box("Outlook read", "The embedded sample view includes segment mix, forward guidance, and valuation context. Enter another ticker to switch to live generic data.")
         c1, c2 = st.columns([0.55, 0.45])
         with c1:
             display_df(segments.round(1))
         with c2:
-            fig = px.pie(segments, values="Q1 2026", names="Segment", title="Q1 2026 Revenue Mix")
+            fig = px.pie(segments, values="Q1 2026", names="Segment", title="Revenue Mix")
             fig.update_layout(template="plotly_dark", height=390)
             st.plotly_chart(fig, use_container_width=True)
 
@@ -1900,6 +2102,7 @@ with tabs[5]:
         if live_annual.empty:
             st.info("No annual financial history returned for this ticker.")
         else:
+            render_summary_box("Growth read", make_growth_summary(live_annual))
             metric = st.selectbox("Chart metric", ["Revenue", "Gross Profit", "Operating Income", "Net Income", "Free Cash Flow"])
             chart_df = live_annual.copy()
             chart_metric = f"{metric} ($B)"
@@ -1925,7 +2128,8 @@ with tabs[5]:
             display_df(live_display, style_rows=False)
     else:
         st.markdown("<div class='section-label'>Five-Year Growth Story</div>", unsafe_allow_html=True)
-        st.info("FY2021–FY2025 actual history plus FY2026E guidance midpoint. FY2026E is forward-looking.")
+        render_summary_box("Growth read", make_growth_summary(annual_metrics))
+        st.info("Historical annual data plus forward estimate where available.")
         cagr_cols = st.columns(4)
         cagr_specs = [
             ("Revenue CAGR", 1527, 4475),
@@ -1952,7 +2156,7 @@ with tabs[5]:
 
 with tabs[6]:
     st.markdown("<div class='section-label'>Scenario Projection Matrix</div>", unsafe_allow_html=True)
-    st.caption("Projection now anchors to current/TTM revenue, net income margin, EPS, and stock price. 2026 Current is the anchor column; 2027 onward is projected.")
+    st.caption("Projection anchors to current/TTM revenue, net income margin, EPS, shares, and stock price. 2026 Current is the anchor column; 2027 onward is projected.")
 
     projection_years = st.slider("Projection years", 1, 10, projection_years)
     assumptions_default = get_default_projection_assumptions(current_price)
@@ -1964,7 +2168,6 @@ with tabs[6]:
             column_config={
                 "Revenue Growth %": st.column_config.NumberColumn(format="%.1f%%"),
                 "Terminal Net Margin %": st.column_config.NumberColumn(format="%.1f%%"),
-                "Dilution CAGR %": st.column_config.NumberColumn(format="%.1f%%"),
                 "Terminal PE Low": st.column_config.NumberColumn(format="%.1fx"),
                 "Terminal PE High": st.column_config.NumberColumn(format="%.1fx"),
             },
@@ -1997,7 +2200,8 @@ with tabs[6]:
         if case_name in matrices:
             render_projection_case_table(case_name, matrices[case_name])
 
-    st.info("Tip: open Edit scenario assumptions to tune growth, margins, dilution, and valuation ranges.")
+    render_summary_box("Projection read", "The projection uses current fundamentals as the anchor, then gradually moves revenue growth, net margin, and terminal P/E toward the bear/base/bull assumptions. Share count is held flat to keep the model simple.")
+    st.info("Tip: open Edit scenario assumptions to tune growth, margins, and valuation ranges.")
 
 with tabs[7]:
     st.markdown("<div class='section-label'>Analyst Price Targets</div>", unsafe_allow_html=True)

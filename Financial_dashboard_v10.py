@@ -2392,6 +2392,128 @@ def _quote_with_fallbacks(peer_ticker: str, peer_market: Dict[str, Any], peer_fu
     return quote, status
 
 
+
+@st.cache_data(ttl=60 * 45, show_spinner=False)
+def build_single_peer_row(peer_ticker: str) -> Dict[str, Any]:
+    """Fetch one peer so the UI can display real per-company progress."""
+    peer_ticker = peer_ticker.upper().strip()
+
+    peer_market = get_market_data(peer_ticker)
+    peer_fundamentals = get_yf_fundamentals(peer_ticker)
+    peer_quote_raw = peer_market.get("quote", {}) if isinstance(peer_market, dict) else {}
+    peer_quote, data_status = _quote_with_fallbacks(peer_ticker, peer_market, peer_fundamentals)
+
+    peer_price = peer_quote.get("last_price") if peer_quote.get("last_price") else np.nan
+    peer_shares_b = (peer_quote.get("shares") / 1e9) if peer_quote.get("shares") else _shares_from_fundamentals(peer_fundamentals)
+    peer_market_cap_b = (peer_quote.get("market_cap") / 1e9) if peer_quote.get("market_cap") else np.nan
+
+    peer_revenue_base_b = compute_start_revenue_from_live(peer_fundamentals, np.nan)
+    peer_anchor = get_projection_anchor(
+        peer_fundamentals,
+        peer_quote,
+        peer_revenue_base_b,
+        peer_shares_b if not pd.isna(peer_shares_b) and peer_shares_b > 0 else np.nan,
+        peer_price if not pd.isna(peer_price) else np.nan,
+    )
+
+    if (pd.isna(peer_market_cap_b) or peer_market_cap_b <= 0) and not pd.isna(peer_price) and not pd.isna(peer_anchor.get("shares_b", np.nan)):
+        peer_market_cap_b = peer_price * peer_anchor.get("shares_b")
+
+    peer_ratio_df = build_ratio_dashboard(
+        peer_fundamentals,
+        peer_quote,
+        peer_price if not pd.isna(peer_price) else np.nan,
+        peer_market_cap_b if not pd.isna(peer_market_cap_b) else np.nan,
+        peer_anchor.get("shares_b", np.nan),
+        peer_revenue_base_b if not pd.isna(peer_revenue_base_b) else np.nan,
+        peer_anchor,
+    )
+
+    errors = []
+    errors.extend(peer_market.get("errors", []) if isinstance(peer_market, dict) else [])
+    errors.extend(peer_fundamentals.get("errors", []) if isinstance(peer_fundamentals, dict) else [])
+    if errors and data_status == "live quote":
+        data_status = "some fields rate-limited"
+
+    return {
+        "Ticker": peer_ticker,
+        "Company": peer_quote.get("long_name") or peer_quote_raw.get("long_name") or peer_ticker,
+        "Data Status": data_status,
+        "Price": f"${peer_price:,.2f}" if not pd.isna(peer_price) else "—",
+        "Market Cap": f"${peer_market_cap_b:,.1f}B" if not pd.isna(peer_market_cap_b) else "—",
+        "Revenue TTM": f"${peer_anchor.get('revenue_b', np.nan):,.2f}B" if not pd.isna(peer_anchor.get("revenue_b", np.nan)) else "—",
+        "Revenue CAGR": _ratio_lookup(peer_ratio_df, "Revenue CAGR"),
+        "Latest FY Growth": _ratio_lookup(peer_ratio_df, "Latest FY Growth"),
+        "Net Margin": _ratio_lookup(peer_ratio_df, "Net Margin"),
+        "FCF Margin": _ratio_lookup(peer_ratio_df, "FCF Margin"),
+        "ROE": _ratio_lookup(peer_ratio_df, "ROE"),
+        "ROA": _ratio_lookup(peer_ratio_df, "ROA"),
+        "P/E": _ratio_lookup(peer_ratio_df, "P/E"),
+        "Forward P/E": _ratio_lookup(peer_ratio_df, "Forward P/E"),
+        "P/S": _ratio_lookup(peer_ratio_df, "P/S"),
+        "PEG": _ratio_lookup(peer_ratio_df, "PEG"),
+        "P/FCF": _ratio_lookup(peer_ratio_df, "P/FCF"),
+        "EV/Sales": _ratio_lookup(peer_ratio_df, "EV/Sales"),
+        "Debt/Equity": _ratio_lookup(peer_ratio_df, "Debt/Equity"),
+        "Net Cash / Debt": _ratio_lookup(peer_ratio_df, "Net Cash / Debt"),
+        "FCF Yield": _ratio_lookup(peer_ratio_df, "FCF Yield"),
+        "Earnings Yield": _ratio_lookup(peer_ratio_df, "Earnings Yield"),
+    }
+
+
+def build_peer_scorecard_from_rows(peer_df: pd.DataFrame) -> pd.DataFrame:
+    """Build peer scorecard from already fetched rows."""
+    if peer_df is None or peer_df.empty:
+        return pd.DataFrame()
+
+    score_rows = []
+    for _, r in peer_df.iterrows():
+        d = r.to_dict()
+        growth_score = np.nanmean([_peer_metric_value(d, "Revenue CAGR"), _peer_metric_value(d, "Latest FY Growth")])
+        profitability_score = np.nanmean([_peer_metric_value(d, "Net Margin"), _peer_metric_value(d, "FCF Margin"), _peer_metric_value(d, "ROE")])
+        balance_score = np.nanmean([
+            -_peer_metric_value(d, "Debt/Equity") if not pd.isna(_peer_metric_value(d, "Debt/Equity")) else np.nan,
+            _peer_metric_value(d, "Net Cash / Debt"),
+        ])
+        valuation_score = np.nanmean([
+            -_peer_metric_value(d, "P/E"),
+            -_peer_metric_value(d, "Forward P/E"),
+            -_peer_metric_value(d, "P/S"),
+            -_peer_metric_value(d, "PEG"),
+            -_peer_metric_value(d, "P/FCF"),
+            _peer_metric_value(d, "FCF Yield"),
+            _peer_metric_value(d, "Earnings Yield"),
+        ])
+        score_rows.append({
+            "Ticker": d["Ticker"],
+            "Growth Raw": growth_score,
+            "Profitability Raw": profitability_score,
+            "Valuation Raw": valuation_score,
+            "Balance Sheet Raw": balance_score,
+        })
+
+    score_df = pd.DataFrame(score_rows)
+
+    def percentile_score(series: pd.Series) -> pd.Series:
+        numeric = pd.to_numeric(series, errors="coerce")
+        if numeric.notna().sum() <= 1:
+            return pd.Series([50 if not pd.isna(x) else np.nan for x in numeric], index=series.index)
+        return numeric.rank(pct=True, ascending=True) * 100
+
+    score_df["Growth Score"] = percentile_score(score_df["Growth Raw"])
+    score_df["Profitability Score"] = percentile_score(score_df["Profitability Raw"])
+    score_df["Valuation Score"] = percentile_score(score_df["Valuation Raw"])
+    score_df["Balance Sheet Score"] = percentile_score(score_df["Balance Sheet Raw"])
+    score_df["Overall Score"] = score_df[["Growth Score", "Profitability Score", "Valuation Score", "Balance Sheet Score"]].mean(axis=1)
+    score_df = score_df.sort_values("Overall Score", ascending=False)
+
+    display_scores = score_df[["Ticker", "Growth Score", "Profitability Score", "Valuation Score", "Balance Sheet Score", "Overall Score"]].copy()
+    for c in display_scores.columns:
+        if c != "Ticker":
+            display_scores[c] = display_scores[c].map(lambda x: f"{x:,.0f}" if not pd.isna(x) else "—")
+    return display_scores
+
+
 @st.cache_data(ttl=60 * 45, show_spinner=False)
 def build_peer_comparison_data(ticker_list: Tuple[str, ...], request_delay_seconds: float = 0.0) -> Tuple[pd.DataFrame, pd.DataFrame]:
     peer_rows: List[Dict[str, Any]] = []
@@ -2991,15 +3113,33 @@ with tabs[8]:
         if run_comparison:
             progress = st.progress(0)
             status = st.empty()
-            status.write("Starting sequential peer fetch...")
+            fetched_rows = []
 
-            with st.spinner("Fetching peer data one company at a time..."):
-                # The actual delay now happens inside the data builder, immediately before each ticker after the first.
-                # This avoids the prior behavior where the app waited in the UI but then made a burst of data calls.
-                peer_df, score_df = build_peer_comparison_data(
-                    peer_tickers,
-                    request_delay_seconds=PEER_REQUEST_DELAY_SECONDS,
-                )
+            total = len(peer_tickers)
+            for i, peer in enumerate(peer_tickers, start=1):
+                if i > 1:
+                    status.write(f"Waiting {PEER_REQUEST_DELAY_SECONDS:.0f} seconds before fetching {peer} ({i}/{total})...")
+                    time.sleep(float(PEER_REQUEST_DELAY_SECONDS))
+
+                status.write(f"Fetching {peer} ({i}/{total})...")
+                progress.progress(int((i - 1) / max(total, 1) * 100))
+
+                try:
+                    row = build_single_peer_row(peer)
+                    fetched_rows.append(row)
+                    status.write(f"Completed {peer} ({i}/{total})")
+                except Exception as e:
+                    fetched_rows.append({
+                        "Ticker": peer,
+                        "Company": peer,
+                        "Data Status": f"fetch failed: {e}",
+                    })
+                    status.write(f"Fetch failed for {peer}: {e}")
+
+                progress.progress(int(i / max(total, 1) * 100))
+
+            peer_df = pd.DataFrame(fetched_rows)
+            score_df = build_peer_scorecard_from_rows(peer_df)
 
             progress.progress(100)
             status.write("Peer comparison complete.")

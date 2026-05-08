@@ -2396,10 +2396,13 @@ def _quote_with_fallbacks(peer_ticker: str, peer_market: Dict[str, Any], peer_fu
 def build_peer_comparison_data(ticker_list: Tuple[str, ...], request_delay_seconds: float = 0.0) -> Tuple[pd.DataFrame, pd.DataFrame]:
     peer_rows: List[Dict[str, Any]] = []
 
-    for peer_ticker in ticker_list:
+    for idx, peer_ticker in enumerate(ticker_list):
         peer_ticker = peer_ticker.upper().strip()
         if not peer_ticker:
             continue
+
+        if idx > 0 and request_delay_seconds and request_delay_seconds > 0:
+            time.sleep(float(request_delay_seconds))
 
         peer_market = get_market_data(peer_ticker)
         peer_fundamentals = get_yf_fundamentals(peer_ticker)
@@ -2463,9 +2466,6 @@ def build_peer_comparison_data(ticker_list: Tuple[str, ...], request_delay_secon
             "Earnings Yield": _ratio_lookup(peer_ratio_df, "Earnings Yield"),
         }
         peer_rows.append(row)
-
-        if request_delay_seconds and request_delay_seconds > 0:
-            time.sleep(float(request_delay_seconds))
 
     peer_df = pd.DataFrame(peer_rows)
     if peer_df.empty:
@@ -2954,6 +2954,9 @@ with tabs[8]:
     st.markdown("<div class='section-label'>Comparative Analysis</div>", unsafe_allow_html=True)
     st.caption("Enter peer tickers to compare valuation, growth, profitability, balance-sheet strength, and cash-flow quality side by side.")
 
+    PEER_REQUEST_DELAY_SECONDS = 20.0
+    PEER_MAX_COMPANIES = 10
+
     default_peers = ticker if ticker else TICKER_DEFAULT
     peer_input = st.text_input(
         "Peer tickers",
@@ -2961,39 +2964,18 @@ with tabs[8]:
         help="Comma-separated tickers, for example: NVDA, AMD, INTC, AVGO",
     )
     peer_tickers = tuple(dict.fromkeys([t.strip().upper() for t in peer_input.replace(";", ",").split(",") if t.strip()]))
-
-    c_delay, c_limit = st.columns([0.55, 0.45])
-    with c_delay:
-        peer_delay = st.slider(
-            "Delay between company data pulls",
-            min_value=0.0,
-            max_value=20.0,
-            value=4.0,
-            step=1.0,
-            help="Higher delay reduces the chance of Yahoo/yfinance rate limits. 4–8 seconds is a reasonable starting point.",
-        )
-    with c_limit:
-        max_peers = st.slider(
-            "Max companies to fetch",
-            min_value=2,
-            max_value=15,
-            value=min(max(len(peer_tickers), 2), 8),
-            step=1,
-            help="Keeping this smaller reduces rate-limit risk.",
-        )
-
-    peer_tickers = peer_tickers[:max_peers]
+    peer_tickers = peer_tickers[:PEER_MAX_COMPANIES]
 
     st.info(
-        "This tab now fetches one company at a time with the selected delay. "
-        "It is slower, but much less aggressive than pulling every peer immediately."
+        f"This tab fetches one company at a time with a fixed {PEER_REQUEST_DELAY_SECONDS:.0f}-second delay between companies. "
+        f"Maximum companies per run is locked to {PEER_MAX_COMPANIES} to reduce Yahoo/yfinance rate limits."
     )
 
     if len(peer_tickers) < 2:
         st.info("Add at least two tickers separated by commas to build a peer comparison.")
     else:
-        estimated_wait = max(len(peer_tickers) - 1, 0) * peer_delay
-        st.caption(f"Selected peers: {', '.join(peer_tickers)} · Estimated intentional wait: ~{estimated_wait:.0f} seconds")
+        estimated_wait = max(len(peer_tickers) - 1, 0) * PEER_REQUEST_DELAY_SECONDS
+        st.caption(f"Selected peers: {', '.join(peer_tickers)} · Intentional wait: ~{estimated_wait:.0f} seconds")
 
         fetch_col, clear_col = st.columns([0.25, 0.75])
         with fetch_col:
@@ -3001,6 +2983,9 @@ with tabs[8]:
         with clear_col:
             if st.button("Clear peer cache"):
                 st.cache_data.clear()
+                st.session_state.pop("peer_comparison_df", None)
+                st.session_state.pop("peer_score_df", None)
+                st.session_state.pop("peer_comparison_tickers", None)
                 st.rerun()
 
         if run_comparison:
@@ -3008,16 +2993,13 @@ with tabs[8]:
             status = st.empty()
             status.write("Starting sequential peer fetch...")
 
-            for i, peer in enumerate(peer_tickers, start=1):
-                status.write(f"Preparing {peer} ({i}/{len(peer_tickers)})...")
-                progress.progress(int((i - 1) / max(len(peer_tickers), 1) * 100))
-                if i > 1 and peer_delay > 0:
-                    time.sleep(float(peer_delay))
-
-            with st.spinner("Building comparison tables..."):
-                # Data fetches still happen inside the cached helper, but the delay is also passed into the cache key
-                # so changing the delay gives Streamlit a fresh run when needed.
-                peer_df, score_df = build_peer_comparison_data(peer_tickers, request_delay_seconds=0.0)
+            with st.spinner("Fetching peer data one company at a time..."):
+                # The actual delay now happens inside the data builder, immediately before each ticker after the first.
+                # This avoids the prior behavior where the app waited in the UI but then made a burst of data calls.
+                peer_df, score_df = build_peer_comparison_data(
+                    peer_tickers,
+                    request_delay_seconds=PEER_REQUEST_DELAY_SECONDS,
+                )
 
             progress.progress(100)
             status.write("Peer comparison complete.")
@@ -3027,6 +3009,10 @@ with tabs[8]:
 
         peer_df = st.session_state.get("peer_comparison_df", pd.DataFrame())
         score_df = st.session_state.get("peer_score_df", pd.DataFrame())
+        stored_tickers = st.session_state.get("peer_comparison_tickers", tuple())
+
+        if not peer_df.empty and stored_tickers != peer_tickers:
+            st.warning("Ticker list changed. Click 'Fetch peer comparison' again to refresh the peer table for the new list.")
 
         if peer_df.empty:
             st.warning("Click 'Fetch peer comparison' to pull peer data sequentially.")

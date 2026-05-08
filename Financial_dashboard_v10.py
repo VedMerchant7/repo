@@ -2298,6 +2298,188 @@ def make_ratio_summary(ratios: pd.DataFrame) -> str:
         f"ROE {lookup.get('ROE', '—')}."
     )
 
+def _parse_ratio_number(value: Any) -> float:
+    if value is None or pd.isna(value):
+        return np.nan
+    s = str(value).strip().replace("$", "").replace(",", "").replace("x", "").replace("%", "")
+    if s in {"", "—", "-", "nan"}:
+        return np.nan
+    multiplier = 1.0
+    upper = s.upper()
+    if upper.endswith("B"):
+        multiplier = 1_000.0
+        s = s[:-1]
+    elif upper.endswith("M"):
+        multiplier = 1.0
+        s = s[:-1]
+    try:
+        return float(s) * multiplier
+    except Exception:
+        return np.nan
+
+
+def _ratio_lookup(ratio_df: pd.DataFrame, ratio_name: str) -> str:
+    if ratio_df is None or ratio_df.empty or "Ratio" not in ratio_df.columns:
+        return "—"
+    match = ratio_df[ratio_df["Ratio"].astype(str).str.lower() == ratio_name.lower()]
+    if match.empty:
+        return "—"
+    return str(match.iloc[0].get("Value", "—"))
+
+
+def _peer_metric_value(peer_row: Dict[str, Any], metric: str) -> float:
+    return _parse_ratio_number(peer_row.get(metric, np.nan))
+
+
+@st.cache_data(ttl=60 * 45, show_spinner=False)
+def build_peer_comparison_data(ticker_list: Tuple[str, ...]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    peer_rows: List[Dict[str, Any]] = []
+
+    for peer_ticker in ticker_list:
+        peer_ticker = peer_ticker.upper().strip()
+        if not peer_ticker:
+            continue
+
+        peer_market = get_market_data(peer_ticker)
+        peer_fundamentals = get_yf_fundamentals(peer_ticker)
+        peer_quote = peer_market.get("quote", {}) if isinstance(peer_market, dict) else {}
+
+        peer_price = peer_quote.get("last_price") or np.nan
+        peer_shares_b = (peer_quote.get("shares") / 1e9) if peer_quote.get("shares") else np.nan
+        if pd.isna(peer_shares_b) or peer_shares_b <= 0:
+            peer_shares_b = 1.0
+
+        peer_market_cap_b = (peer_quote.get("market_cap") / 1e9) if peer_quote.get("market_cap") else (
+            peer_price * peer_shares_b if not pd.isna(peer_price) else np.nan
+        )
+
+        peer_revenue_base_b = compute_start_revenue_from_live(peer_fundamentals, np.nan)
+        peer_anchor = get_projection_anchor(peer_fundamentals, peer_quote, peer_revenue_base_b, peer_shares_b, peer_price if not pd.isna(peer_price) else 0)
+        peer_ratio_df = build_ratio_dashboard(
+            peer_fundamentals,
+            peer_quote,
+            peer_price if not pd.isna(peer_price) else 0,
+            peer_market_cap_b if not pd.isna(peer_market_cap_b) else 0,
+            peer_shares_b,
+            peer_revenue_base_b if not pd.isna(peer_revenue_base_b) else 0,
+            peer_anchor,
+        )
+
+        row = {
+            "Ticker": peer_ticker,
+            "Company": peer_quote.get("long_name") or peer_ticker,
+            "Price": f"${peer_price:,.2f}" if not pd.isna(peer_price) else "—",
+            "Market Cap": f"${peer_market_cap_b:,.1f}B" if not pd.isna(peer_market_cap_b) else "—",
+            "Revenue TTM": f"${peer_anchor.get('revenue_b', np.nan):,.2f}B" if not pd.isna(peer_anchor.get("revenue_b", np.nan)) else "—",
+            "Revenue CAGR": _ratio_lookup(peer_ratio_df, "Revenue CAGR"),
+            "Latest FY Growth": _ratio_lookup(peer_ratio_df, "Latest FY Growth"),
+            "Net Margin": _ratio_lookup(peer_ratio_df, "Net Margin"),
+            "FCF Margin": _ratio_lookup(peer_ratio_df, "FCF Margin"),
+            "ROE": _ratio_lookup(peer_ratio_df, "ROE"),
+            "ROA": _ratio_lookup(peer_ratio_df, "ROA"),
+            "P/E": _ratio_lookup(peer_ratio_df, "P/E"),
+            "Forward P/E": _ratio_lookup(peer_ratio_df, "Forward P/E"),
+            "P/S": _ratio_lookup(peer_ratio_df, "P/S"),
+            "PEG": _ratio_lookup(peer_ratio_df, "PEG"),
+            "P/FCF": _ratio_lookup(peer_ratio_df, "P/FCF"),
+            "EV/Sales": _ratio_lookup(peer_ratio_df, "EV/Sales"),
+            "Debt/Equity": _ratio_lookup(peer_ratio_df, "Debt/Equity"),
+            "Net Cash / Debt": _ratio_lookup(peer_ratio_df, "Net Cash / Debt"),
+            "FCF Yield": _ratio_lookup(peer_ratio_df, "FCF Yield"),
+            "Earnings Yield": _ratio_lookup(peer_ratio_df, "Earnings Yield"),
+        }
+        peer_rows.append(row)
+
+    peer_df = pd.DataFrame(peer_rows)
+    if peer_df.empty:
+        return peer_df, pd.DataFrame()
+
+    score_rows = []
+    for _, r in peer_df.iterrows():
+        d = r.to_dict()
+        growth_score = np.nanmean([_peer_metric_value(d, "Revenue CAGR"), _peer_metric_value(d, "Latest FY Growth")])
+        profitability_score = np.nanmean([_peer_metric_value(d, "Net Margin"), _peer_metric_value(d, "FCF Margin"), _peer_metric_value(d, "ROE")])
+        balance_score = np.nanmean([
+            -_peer_metric_value(d, "Debt/Equity") if not pd.isna(_peer_metric_value(d, "Debt/Equity")) else np.nan,
+            _peer_metric_value(d, "Net Cash / Debt"),
+        ])
+        valuation_score = np.nanmean([
+            -_peer_metric_value(d, "P/E"),
+            -_peer_metric_value(d, "Forward P/E"),
+            -_peer_metric_value(d, "P/S"),
+            -_peer_metric_value(d, "PEG"),
+            -_peer_metric_value(d, "P/FCF"),
+            _peer_metric_value(d, "FCF Yield"),
+            _peer_metric_value(d, "Earnings Yield"),
+        ])
+        score_rows.append({
+            "Ticker": d["Ticker"],
+            "Growth Raw": growth_score,
+            "Profitability Raw": profitability_score,
+            "Valuation Raw": valuation_score,
+            "Balance Sheet Raw": balance_score,
+        })
+
+    score_df = pd.DataFrame(score_rows)
+
+    def percentile_score(series: pd.Series) -> pd.Series:
+        numeric = pd.to_numeric(series, errors="coerce")
+        if numeric.notna().sum() <= 1:
+            return pd.Series([50 if not pd.isna(x) else np.nan for x in numeric], index=series.index)
+        return numeric.rank(pct=True, ascending=True) * 100
+
+    score_df["Growth Score"] = percentile_score(score_df["Growth Raw"])
+    score_df["Profitability Score"] = percentile_score(score_df["Profitability Raw"])
+    score_df["Valuation Score"] = percentile_score(score_df["Valuation Raw"])
+    score_df["Balance Sheet Score"] = percentile_score(score_df["Balance Sheet Raw"])
+    score_df["Overall Score"] = score_df[["Growth Score", "Profitability Score", "Valuation Score", "Balance Sheet Score"]].mean(axis=1)
+    score_df = score_df.sort_values("Overall Score", ascending=False)
+
+    display_scores = score_df[["Ticker", "Growth Score", "Profitability Score", "Valuation Score", "Balance Sheet Score", "Overall Score"]].copy()
+    for c in display_scores.columns:
+        if c != "Ticker":
+            display_scores[c] = display_scores[c].map(lambda x: f"{x:,.0f}" if not pd.isna(x) else "—")
+
+    return peer_df, display_scores
+
+
+def build_peer_summary(peer_df: pd.DataFrame, score_df: pd.DataFrame) -> str:
+    if peer_df is None or peer_df.empty:
+        return "Enter two or more tickers to generate a peer comparison."
+
+    parts = []
+    if score_df is not None and not score_df.empty:
+        leader = score_df.iloc[0]["Ticker"]
+        parts.append(f"{leader} screens best overall on the current weighted scorecard.")
+
+    def best_by(metric: str, lower_better: bool = False) -> str:
+        vals = []
+        for _, r in peer_df.iterrows():
+            v = _parse_ratio_number(r.get(metric))
+            if not pd.isna(v):
+                vals.append((r["Ticker"], v))
+        if not vals:
+            return ""
+        vals = sorted(vals, key=lambda x: x[1], reverse=not lower_better)
+        return vals[0][0]
+
+    growth_leader = best_by("Revenue CAGR")
+    margin_leader = best_by("Net Margin")
+    cheap_ps = best_by("P/S", lower_better=True)
+    fcf_yield_leader = best_by("FCF Yield")
+
+    if growth_leader:
+        parts.append(f"{growth_leader} has the strongest available historical revenue CAGR.")
+    if margin_leader:
+        parts.append(f"{margin_leader} has the strongest net-margin profile.")
+    if cheap_ps:
+        parts.append(f"{cheap_ps} screens cheapest on price-to-sales.")
+    if fcf_yield_leader:
+        parts.append(f"{fcf_yield_leader} has the highest free-cash-flow yield.")
+
+    return " ".join(parts) if parts else "Comparison generated, but some fields are blank because the source data was incomplete."
+
+
 with st.sidebar:
     st.markdown("### Financial Dashboard Builder")
     ticker = st.text_input("Ticker", value=TICKER_DEFAULT).upper().strip() or TICKER_DEFAULT
@@ -2384,6 +2566,7 @@ tabs = st.tabs([
     "Growth History",
     "Stock Projection",
     "Analyst & Insider Data",
+    "Comparative Analysis",
     "Export Data",
 ])
 
@@ -2691,6 +2874,70 @@ with tabs[7]:
                 st.write("-", err)
 
 with tabs[8]:
+    st.markdown("<div class='section-label'>Comparative Analysis</div>", unsafe_allow_html=True)
+    st.caption("Enter peer tickers to compare valuation, growth, profitability, balance-sheet strength, and cash-flow quality side by side.")
+
+    default_peers = ticker if ticker else TICKER_DEFAULT
+    peer_input = st.text_input("Peer tickers", value=default_peers, help="Comma-separated tickers, for example: NVDA, AMD, INTC, AVGO")
+    peer_tickers = tuple(dict.fromkeys([t.strip().upper() for t in peer_input.replace(";", ",").split(",") if t.strip()]))
+
+    if len(peer_tickers) < 2:
+        st.info("Add at least two tickers separated by commas to build a peer comparison.")
+    else:
+        with st.spinner("Building peer comparison..."):
+            peer_df, score_df = build_peer_comparison_data(peer_tickers)
+
+        render_summary_box("Peer read", build_peer_summary(peer_df, score_df))
+
+        st.markdown("<div class='section-label'>Peer Scorecard</div>", unsafe_allow_html=True)
+        if score_df.empty:
+            st.info("No scorecard could be generated. Check ticker symbols or data availability.")
+        else:
+            display_df(score_df, style_rows=False)
+
+        st.markdown("<div class='section-label'>Side-by-Side Metrics</div>", unsafe_allow_html=True)
+        if peer_df.empty:
+            st.info("No comparison data returned. Check ticker symbols or yfinance availability.")
+        else:
+            display_df(peer_df, height=520, style_rows=False)
+
+            numeric_plot = peer_df.copy()
+            for col in ["P/S", "P/E", "Forward P/E", "Revenue CAGR", "Net Margin", "FCF Margin", "FCF Yield"]:
+                if col in numeric_plot.columns:
+                    numeric_plot[col + " Numeric"] = numeric_plot[col].map(_parse_ratio_number)
+
+            st.markdown("<div class='section-label'>Growth vs Valuation</div>", unsafe_allow_html=True)
+            if {"Revenue CAGR Numeric", "P/S Numeric"}.issubset(numeric_plot.columns):
+                fig = px.scatter(
+                    numeric_plot,
+                    x="Revenue CAGR Numeric",
+                    y="P/S Numeric",
+                    text="Ticker",
+                    hover_name="Company",
+                    title="Revenue Growth vs Price/Sales",
+                    labels={"Revenue CAGR Numeric": "Revenue CAGR (%)", "P/S Numeric": "Price / Sales (x)"},
+                )
+                fig.update_traces(textposition="top center")
+                fig.update_layout(template="plotly_dark", height=430)
+                st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("<div class='section-label'>Profitability Comparison</div>", unsafe_allow_html=True)
+            profit_cols = []
+            for col in ["Net Margin", "FCF Margin", "ROE"]:
+                numeric_col = col + " Numeric"
+                if numeric_col in numeric_plot.columns:
+                    profit_cols.append(numeric_col)
+            if profit_cols:
+                chart_df = numeric_plot[["Ticker"] + profit_cols].copy()
+                chart_df = chart_df.rename(columns={c: c.replace(" Numeric", "") for c in profit_cols})
+                melted = chart_df.melt("Ticker", var_name="Metric", value_name="Percent")
+                fig = px.bar(melted, x="Ticker", y="Percent", color="Metric", barmode="group", title="Profitability and Return Metrics")
+                fig.update_layout(template="plotly_dark", height=430, yaxis_title="%")
+                st.plotly_chart(fig, use_container_width=True)
+
+
+
+with tabs[9]:
     st.markdown("<div class='section-label'>Export Dashboard Data</div>", unsafe_allow_html=True)
     if is_live_generic:
         export_tables = {

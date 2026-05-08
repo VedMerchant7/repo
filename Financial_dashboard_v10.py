@@ -2393,12 +2393,97 @@ def _quote_with_fallbacks(peer_ticker: str, peer_market: Dict[str, Any], peer_fu
 
 
 
+
+@st.cache_data(ttl=60 * 45, show_spinner=False)
+def get_peer_market_light(ticker: str) -> Dict[str, Any]:
+    """Lightweight peer quote fetch for comparison tab.
+
+    This intentionally avoids analyst targets, recommendations, insider data, and most of Ticker.info.
+    Those calls are much more likely to trigger Yahoo/yfinance rate limits.
+    """
+    result: Dict[str, Any] = {
+        "ticker": ticker.upper(),
+        "quote": {},
+        "history": pd.DataFrame(),
+        "errors": [],
+    }
+    if yf is None:
+        result["errors"].append("yfinance is not installed.")
+        return result
+
+    try:
+        t = yf.Ticker(ticker)
+
+        try:
+            hist = t.history(period="5d", interval="1d", auto_adjust=False)
+            if isinstance(hist, pd.DataFrame):
+                result["history"] = hist.copy()
+        except Exception as e:
+            result["errors"].append(f"history fetch failed: {e}")
+
+        try:
+            fi = getattr(t, "fast_info", {}) or {}
+            last_price = None
+            market_cap = None
+            shares = None
+
+            for key in ["last_price", "lastPrice", "regular_market_price", "regularMarketPrice", "previous_close", "previousClose"]:
+                try:
+                    candidate = fi.get(key)
+                    if candidate is not None and not pd.isna(candidate) and float(candidate) > 0:
+                        last_price = float(candidate)
+                        break
+                except Exception:
+                    pass
+
+            for key in ["market_cap", "marketCap"]:
+                try:
+                    candidate = fi.get(key)
+                    if candidate is not None and not pd.isna(candidate) and float(candidate) > 0:
+                        market_cap = float(candidate)
+                        break
+                except Exception:
+                    pass
+
+            for key in ["shares", "shares_outstanding", "sharesOutstanding"]:
+                try:
+                    candidate = fi.get(key)
+                    if candidate is not None and not pd.isna(candidate) and float(candidate) > 0:
+                        shares = float(candidate)
+                        break
+                except Exception:
+                    pass
+
+            if last_price is None:
+                hist_price = _last_history_price(result)
+                if not pd.isna(hist_price):
+                    last_price = float(hist_price)
+
+            result["quote"] = {
+                "last_price": last_price,
+                "market_cap": market_cap,
+                "shares": shares,
+                "long_name": ticker.upper(),
+                "trailing_pe": None,
+                "forward_pe": None,
+                "currency": "USD",
+            }
+        except Exception as e:
+            result["errors"].append(f"fast_info fetch failed: {e}")
+
+    except Exception as e:
+        result["errors"].append(f"light peer market fetch failed: {e}")
+
+    return result
+
+
 @st.cache_data(ttl=60 * 45, show_spinner=False)
 def build_single_peer_row(peer_ticker: str) -> Dict[str, Any]:
     """Fetch one peer so the UI can display real per-company progress."""
     peer_ticker = peer_ticker.upper().strip()
 
-    peer_market = get_market_data(peer_ticker)
+    peer_market = get_peer_market_light(peer_ticker)
+    time.sleep(2.0)
     peer_fundamentals = get_yf_fundamentals(peer_ticker)
     peer_quote_raw = peer_market.get("quote", {}) if isinstance(peer_market, dict) else {}
     peer_quote, data_status = _quote_with_fallbacks(peer_ticker, peer_market, peer_fundamentals)
@@ -3090,7 +3175,8 @@ with tabs[8]:
 
     st.info(
         f"This tab fetches one company at a time with a fixed {PEER_REQUEST_DELAY_SECONDS:.0f}-second delay between companies. "
-        f"Maximum companies per run is locked to {PEER_MAX_COMPANIES} to reduce Yahoo/yfinance rate limits."
+        f"Maximum companies per run is locked to {PEER_MAX_COMPANIES}. "
+        "Peer comparison now uses a lightweight quote pull to avoid the heavier Yahoo endpoints that trigger rate limits."
     )
 
     if len(peer_tickers) < 2:
@@ -3121,7 +3207,7 @@ with tabs[8]:
                     status.write(f"Waiting {PEER_REQUEST_DELAY_SECONDS:.0f} seconds before fetching {peer} ({i}/{total})...")
                     time.sleep(float(PEER_REQUEST_DELAY_SECONDS))
 
-                status.write(f"Fetching {peer} ({i}/{total})...")
+                status.write(f"Fetching {peer} ({i}/{total}) using lightweight quote + fundamentals pull...")
                 progress.progress(int((i - 1) / max(total, 1) * 100))
 
                 try:

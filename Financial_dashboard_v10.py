@@ -2029,40 +2029,76 @@ SEC_STATEMENT_MAP = {
 }
 
 
+def _sec_prepare_fact_df(raw_rows: List[Dict[str, Any]], tag: str, unit: str) -> pd.DataFrame:
+    df = pd.DataFrame(raw_rows)
+    if df.empty or "val" not in df.columns:
+        return pd.DataFrame()
+
+    for col in ["fy", "fp", "form", "filed", "start", "end", "frame"]:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    df["tag"] = tag
+    df["unit"] = unit
+    df["filed_dt"] = pd.to_datetime(df["filed"], errors="coerce")
+    df["start_dt"] = pd.to_datetime(df["start"], errors="coerce")
+    df["end_dt"] = pd.to_datetime(df["end"], errors="coerce")
+    df["duration_days"] = (df["end_dt"] - df["start_dt"]).dt.days
+    df = df[df["form"].isin(["10-K", "10-Q", "10-K/A", "10-Q/A"])].copy()
+    return df
+
+
 def _sec_fact_records(companyfacts: Dict[str, Any], tags: List[str]) -> Tuple[str, str, pd.DataFrame]:
+    """Return the best available SEC fact dataframe for a list of candidate tags.
+
+    Instead of taking the first tag that exists, choose the tag with the newest and richest
+    usable history. This avoids stale tags such as older revenue concepts creating only a
+    couple of old columns.
+    """
     facts = companyfacts.get("facts", {}) if isinstance(companyfacts, dict) else {}
     us_gaap = facts.get("us-gaap", {})
+    candidates: List[Tuple[str, str, pd.DataFrame, pd.Timestamp, int]] = []
+
     for tag in tags:
         if tag not in us_gaap:
             continue
+
         units = us_gaap[tag].get("units", {})
         preferred_units = ["USD", "shares", "USD/shares", "pure"]
         unit = ""
-        arr = []
+        arr: List[Dict[str, Any]] = []
+
         for u in preferred_units:
             if u in units and isinstance(units[u], list):
                 unit, arr = u, units[u]
                 break
+
         if not arr:
             for u, candidate in units.items():
                 if isinstance(candidate, list):
                     unit, arr = u, candidate
                     break
-        if arr:
-            df = pd.DataFrame(arr)
-            if not df.empty and "val" in df.columns:
-                for col in ["fy", "fp", "form", "filed", "start", "end", "frame"]:
-                    if col not in df.columns:
-                        df[col] = np.nan
-                df["tag"] = tag
-                df["unit"] = unit
-                df["filed_dt"] = pd.to_datetime(df["filed"], errors="coerce")
-                df["start_dt"] = pd.to_datetime(df["start"], errors="coerce")
-                df["end_dt"] = pd.to_datetime(df["end"], errors="coerce")
-                df["duration_days"] = (df["end_dt"] - df["start_dt"]).dt.days
-                df = df[df["form"].isin(["10-K", "10-Q", "10-K/A", "10-Q/A"])].copy()
-                return tag, unit, df
-    return "", "", pd.DataFrame()
+
+        df = _sec_prepare_fact_df(arr, tag, unit)
+        if df.empty:
+            continue
+
+        max_end = df["end_dt"].max()
+        usable_count = int(df["val"].notna().sum())
+        candidates.append((tag, unit, df, max_end, usable_count))
+
+    if not candidates:
+        return "", "", pd.DataFrame()
+
+    candidates = sorted(
+        candidates,
+        key=lambda x: (
+            pd.Timestamp.min if pd.isna(x[3]) else x[3],
+            x[4],
+        ),
+        reverse=True,
+    )
+    return candidates[0][0], candidates[0][1], candidates[0][2]
 
 
 def _sec_format_value(value: Any, unit: str, kind: str) -> str:
@@ -2086,60 +2122,99 @@ def _sec_format_value(value: Any, unit: str, kind: str) -> str:
 def _sec_split_periods(df: pd.DataFrame, statement_type: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df.empty:
         return pd.DataFrame(), pd.DataFrame()
+
     if statement_type in {"income", "cashflow"}:
-        annual = df[(df["fp"].astype(str).str.upper() == "FY") | (df["duration_days"] >= 300) | (df["form"].isin(["10-K", "10-K/A"]))].copy()
-        quarterly = df[(df["form"].isin(["10-Q", "10-Q/A"])) & ((df["duration_days"].isna()) | (df["duration_days"] <= 120))].copy()
+        annual = df[
+            (df["fp"].astype(str).str.upper() == "FY")
+            | (df["duration_days"] >= 300)
+            | ((df["form"].isin(["10-K", "10-K/A"])) & (df["duration_days"].isna()))
+        ].copy()
+        quarterly = df[
+            (df["form"].isin(["10-Q", "10-Q/A"]))
+            & ((df["duration_days"].isna()) | (df["duration_days"] <= 125))
+            & (df["fp"].astype(str).str.upper().isin(["Q1", "Q2", "Q3"]))
+        ].copy()
     else:
         annual = df[(df["fp"].astype(str).str.upper() == "FY") | (df["form"].isin(["10-K", "10-K/A"]))].copy()
-        quarterly = df[df["form"].isin(["10-Q", "10-Q/A"])].copy()
+        quarterly = df[(df["form"].isin(["10-Q", "10-Q/A"])) & (df["fp"].astype(str).str.upper().isin(["Q1", "Q2", "Q3"]))].copy()
+
     annual = annual.sort_values(["end_dt", "filed_dt"], ascending=[True, True]).drop_duplicates(subset=["end"], keep="last")
     quarterly = quarterly.sort_values(["end_dt", "filed_dt"], ascending=[True, True]).drop_duplicates(subset=["end"], keep="last")
     return annual, quarterly
 
 
 def _sec_period_labels(companyfacts: Dict[str, Any], statement_type: str) -> Tuple[List[str], List[str], Dict[str, str], Dict[str, str]]:
-    annual_ends: List[str] = []
-    quarter_ends: List[str] = []
-    annual_labels: Dict[str, str] = {}
-    quarter_labels: Dict[str, str] = {}
+    """Collect a union of recent periods across all mapped rows.
+
+    The prior first-rev logic stopped after the first mapped tag. If that tag was sparse
+    or stale, the table could show only a couple of columns like FY2020 and FY2022.
+    """
+    annual_periods: Dict[str, Tuple[pd.Timestamp, str]] = {}
+    quarter_periods: Dict[str, Tuple[pd.Timestamp, str]] = {}
 
     for _, tags, _ in SEC_STATEMENT_MAP[statement_type]:
         if not tags or tags == ["__SEC_FCF__"]:
             continue
-        _, _, df = _sec_fact_records(companyfacts, tags)
-        annual, quarterly = _sec_split_periods(df, statement_type)
-        if not annual.empty:
-            recent_annual = annual.tail(5)
-            annual_ends = [str(x) for x in recent_annual["end"].tolist()]
-            for _, r in recent_annual.iterrows():
-                try:
-                    annual_labels[str(r["end"])] = f"FY{int(r['fy'])}"
-                except Exception:
-                    annual_labels[str(r["end"])] = str(r["end"])
-        if not quarterly.empty:
-            recent_q = quarterly.tail(1)
-            quarter_ends = [str(x) for x in recent_q["end"].tolist()]
-            for _, r in recent_q.iterrows():
-                fp = str(r.get("fp", "Q")).upper()
-                try:
-                    quarter_labels[str(r["end"])] = f"{fp} {int(r['fy'])}"
-                except Exception:
-                    quarter_labels[str(r["end"])] = str(r["end"])
-        if annual_ends or quarter_ends:
-            break
 
+        _, _, df = _sec_fact_records(companyfacts, tags)
+        if df.empty:
+            continue
+
+        annual, quarterly = _sec_split_periods(df, statement_type)
+
+        for _, r in annual.iterrows():
+            end = str(r.get("end", ""))
+            if not end:
+                continue
+            end_dt = r.get("end_dt", pd.NaT)
+            try:
+                label = f"FY{int(r['fy'])}" if not pd.isna(r.get("fy")) else f"FY{pd.to_datetime(end).year}"
+            except Exception:
+                label = end
+            annual_periods[end] = (end_dt, label)
+
+        for _, r in quarterly.iterrows():
+            end = str(r.get("end", ""))
+            if not end:
+                continue
+            end_dt = r.get("end_dt", pd.NaT)
+            fp = str(r.get("fp", "Q")).upper()
+            try:
+                label = f"{fp} {int(r['fy'])}" if not pd.isna(r.get("fy")) else f"{fp} {pd.to_datetime(end).year}"
+            except Exception:
+                label = end
+            quarter_periods[end] = (end_dt, label)
+
+    annual_sorted = sorted(
+        annual_periods.items(),
+        key=lambda kv: pd.Timestamp.min if pd.isna(kv[1][0]) else kv[1][0],
+    )[-5:]
+    quarter_sorted = sorted(
+        quarter_periods.items(),
+        key=lambda kv: pd.Timestamp.min if pd.isna(kv[1][0]) else kv[1][0],
+    )[-1:]
+
+    annual_ends = [k for k, _ in annual_sorted]
+    quarter_ends = [k for k, _ in quarter_sorted]
+    annual_labels = {k: v[1] for k, v in annual_sorted}
+    quarter_labels = {k: v[1] for k, v in quarter_sorted}
     return annual_ends, quarter_ends, annual_labels, quarter_labels
 
 
 def _sec_value_for_end(companyfacts: Dict[str, Any], tags: List[str], statement_type: str, end: str, period_type: str) -> Tuple[float, str]:
-    _, unit, df = _sec_fact_records(companyfacts, tags)
+    tag, unit, df = _sec_fact_records(companyfacts, tags)
+    if df.empty:
+        return np.nan, unit
+
     annual, quarterly = _sec_split_periods(df, statement_type)
     sub = annual if period_type == "annual" else quarterly
     if sub.empty:
         return np.nan, unit
-    match = sub[sub["end"].astype(str) == str(end)].sort_values("filed_dt", ascending=False)
+
+    match = sub[sub["end"].astype(str) == str(end)].sort_values("filed_dt", ascending=True)
     if match.empty:
         return np.nan, unit
+
     return float(match.iloc[-1]["val"]), str(match.iloc[-1].get("unit", unit))
 
 

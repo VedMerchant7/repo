@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
@@ -1858,6 +1859,367 @@ def build_live_forward_view(market_data: Dict[str, Any], quote: Dict[str, Any], 
 
 
 
+SEC_USER_AGENT = "FinancialDashboardBuilder/1.0 contact@example.com"
+SEC_TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
+SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik10}.json"
+SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik10}.json"
+
+
+def _sec_headers() -> Dict[str, str]:
+    return {
+        "User-Agent": SEC_USER_AGENT,
+        "Accept-Encoding": "gzip, deflate",
+    }
+
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def sec_ticker_map() -> pd.DataFrame:
+    """Official SEC ticker to CIK mapping."""
+    if requests is None:
+        return pd.DataFrame(columns=["ticker", "cik_str", "title", "cik10"])
+    try:
+        r = requests.get(SEC_TICKER_MAP_URL, headers=_sec_headers(), timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        rows = []
+        for _, item in data.items():
+            cik = int(item.get("cik_str"))
+            rows.append({
+                "ticker": str(item.get("ticker", "")).upper(),
+                "cik_str": cik,
+                "title": item.get("title", ""),
+                "cik10": f"{cik:010d}",
+            })
+        return pd.DataFrame(rows)
+    except Exception:
+        return pd.DataFrame(columns=["ticker", "cik_str", "title", "cik10"])
+
+
+def sec_lookup_ticker(ticker: str) -> Dict[str, Any]:
+    table = sec_ticker_map()
+    if table.empty:
+        return {}
+    match = table[table["ticker"].astype(str).str.upper() == ticker.upper()]
+    if match.empty:
+        return {}
+    return match.iloc[0].to_dict()
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def sec_submissions(cik10: str) -> Dict[str, Any]:
+    if requests is None or not cik10:
+        return {"errors": ["requests is not installed"]}
+    try:
+        r = requests.get(SEC_SUBMISSIONS_URL.format(cik10=cik10), headers=_sec_headers(), timeout=25)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"errors": [str(e)]}
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def sec_companyfacts(cik10: str) -> Dict[str, Any]:
+    if requests is None or not cik10:
+        return {"errors": ["requests is not installed"]}
+    try:
+        r = requests.get(SEC_COMPANYFACTS_URL.format(cik10=cik10), headers=_sec_headers(), timeout=35)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"errors": [str(e)]}
+
+
+def sec_filings_table(submissions: Dict[str, Any], limit: int = 6) -> pd.DataFrame:
+    recent = submissions.get("filings", {}).get("recent", {}) if isinstance(submissions, dict) else {}
+    if not recent:
+        return pd.DataFrame()
+
+    rows = []
+    forms = recent.get("form", [])
+    accession = recent.get("accessionNumber", [])
+    filed = recent.get("filingDate", [])
+    periods = recent.get("reportDate", [])
+    primary_docs = recent.get("primaryDocument", [])
+    cik_no_zero = str(submissions.get("cik", "")).lstrip("0")
+
+    for i, form in enumerate(forms):
+        if form not in {"10-K", "10-Q"}:
+            continue
+        acc = accession[i] if i < len(accession) else ""
+        primary = primary_docs[i] if i < len(primary_docs) else ""
+        acc_no_dash = acc.replace("-", "")
+        url = f"https://www.sec.gov/Archives/edgar/data/{cik_no_zero}/{acc_no_dash}/{primary}" if cik_no_zero and acc and primary else ""
+        rows.append({
+            "Form": form,
+            "Filing Date": filed[i] if i < len(filed) else "",
+            "Period End": periods[i] if i < len(periods) else "",
+            "Accession": acc,
+            "Document": primary,
+            "URL": url,
+        })
+        if len(rows) >= limit:
+            break
+
+    return pd.DataFrame(rows)
+
+
+SEC_STATEMENT_MAP = {
+    "income": [
+        ("REVENUE & PROFITABILITY", None, None),
+        ("Total Revenue", ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet", "SalesRevenueGoodsNet"], "money"),
+        ("Cost of Revenue", ["CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsSold"], "money"),
+        ("Gross Profit", ["GrossProfit"], "money"),
+        ("OPERATING EXPENSES", None, None),
+        ("Research & Development", ["ResearchAndDevelopmentExpense"], "money"),
+        ("Sales & Marketing", ["SellingAndMarketingExpense"], "money"),
+        ("SG&A", ["SellingGeneralAndAdministrativeExpense", "GeneralAndAdministrativeExpense"], "money"),
+        ("Operating Expenses", ["OperatingExpenses"], "money"),
+        ("Operating Income", ["OperatingIncomeLoss"], "money"),
+        ("NET INCOME & EPS", None, None),
+        ("Interest Expense", ["InterestExpenseNonOperating", "InterestExpense"], "money"),
+        ("Pretax Income", ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest", "IncomeLossFromContinuingOperationsBeforeIncomeTaxes"], "money"),
+        ("Tax Provision", ["IncomeTaxExpenseBenefit"], "money"),
+        ("Net Income", ["NetIncomeLoss", "ProfitLoss"], "money"),
+        ("Diluted EPS", ["EarningsPerShareDiluted"], "eps"),
+        ("Diluted Shares", ["WeightedAverageNumberOfDilutedSharesOutstanding"], "shares"),
+    ],
+    "balance": [
+        ("ASSETS", None, None),
+        ("Cash & Equivalents", ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"], "money"),
+        ("Short-Term Investments", ["ShortTermInvestments", "MarketableSecuritiesCurrent"], "money"),
+        ("Accounts Receivable", ["AccountsReceivableNetCurrent", "AccountsReceivableNet"], "money"),
+        ("Inventory", ["InventoryNet"], "money"),
+        ("Current Assets", ["AssetsCurrent"], "money"),
+        ("PP&E", ["PropertyPlantAndEquipmentNet"], "money"),
+        ("Goodwill", ["Goodwill"], "money"),
+        ("Intangible Assets", ["FiniteLivedIntangibleAssetsNet", "IntangibleAssetsNetExcludingGoodwill"], "money"),
+        ("Total Assets", ["Assets"], "money"),
+        ("LIABILITIES", None, None),
+        ("Accounts Payable", ["AccountsPayableCurrent", "AccountsPayableTradeCurrent"], "money"),
+        ("Current Liabilities", ["LiabilitiesCurrent"], "money"),
+        ("Short-Term Debt", ["ShortTermBorrowings", "ShortTermDebtCurrent"], "money"),
+        ("Long-Term Debt", ["LongTermDebtNoncurrent", "LongTermDebt"], "money"),
+        ("Total Liabilities", ["Liabilities"], "money"),
+        ("EQUITY", None, None),
+        ("Common Stock & APIC", ["CommonStocksIncludingAdditionalPaidInCapital", "AdditionalPaidInCapital"], "money"),
+        ("Retained Earnings", ["RetainedEarningsAccumulatedDeficit"], "money"),
+        ("Shareholders' Equity", ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"], "money"),
+        ("Total Liabilities & Equity", ["LiabilitiesAndStockholdersEquity"], "money"),
+    ],
+    "cashflow": [
+        ("OPERATING CASH FLOW", None, None),
+        ("Net Income", ["NetIncomeLoss", "ProfitLoss"], "money"),
+        ("Depreciation & Amortization", ["DepreciationDepletionAndAmortization", "DepreciationAndAmortization"], "money"),
+        ("Stock-Based Compensation", ["ShareBasedCompensation"], "money"),
+        ("Operating Cash Flow", ["NetCashProvidedByUsedInOperatingActivities", "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"], "money"),
+        ("INVESTING CASH FLOW", None, None),
+        ("CapEx", ["PaymentsToAcquirePropertyPlantAndEquipment", "CapitalExpenditures"], "money"),
+        ("Acquisitions", ["PaymentsToAcquireBusinessesNetOfCashAcquired"], "money"),
+        ("Investing Cash Flow", ["NetCashProvidedByUsedInInvestingActivities"], "money"),
+        ("FINANCING CASH FLOW", None, None),
+        ("Dividends Paid", ["PaymentsOfDividends", "PaymentsOfDividendsCommonStock"], "money"),
+        ("Share Repurchases", ["PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity"], "money"),
+        ("Debt Issuance", ["ProceedsFromIssuanceOfLongTermDebt", "ProceedsFromBorrowings"], "money"),
+        ("Debt Repayment", ["RepaymentsOfLongTermDebt", "RepaymentsOfDebt"], "money"),
+        ("Financing Cash Flow", ["NetCashProvidedByUsedInFinancingActivities"], "money"),
+        ("FREE CASH FLOW", None, None),
+        ("Free Cash Flow", ["__SEC_FCF__"], "money"),
+        ("Net Change in Cash", ["CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseIncludingExchangeRateEffect", "CashAndCashEquivalentsPeriodIncreaseDecrease"], "money"),
+    ],
+}
+
+
+def _sec_fact_records(companyfacts: Dict[str, Any], tags: List[str]) -> Tuple[str, str, pd.DataFrame]:
+    facts = companyfacts.get("facts", {}) if isinstance(companyfacts, dict) else {}
+    us_gaap = facts.get("us-gaap", {})
+    for tag in tags:
+        if tag not in us_gaap:
+            continue
+        units = us_gaap[tag].get("units", {})
+        preferred_units = ["USD", "shares", "USD/shares", "pure"]
+        unit = ""
+        arr = []
+        for u in preferred_units:
+            if u in units and isinstance(units[u], list):
+                unit, arr = u, units[u]
+                break
+        if not arr:
+            for u, candidate in units.items():
+                if isinstance(candidate, list):
+                    unit, arr = u, candidate
+                    break
+        if arr:
+            df = pd.DataFrame(arr)
+            if not df.empty and "val" in df.columns:
+                for col in ["fy", "fp", "form", "filed", "start", "end", "frame"]:
+                    if col not in df.columns:
+                        df[col] = np.nan
+                df["tag"] = tag
+                df["unit"] = unit
+                df["filed_dt"] = pd.to_datetime(df["filed"], errors="coerce")
+                df["start_dt"] = pd.to_datetime(df["start"], errors="coerce")
+                df["end_dt"] = pd.to_datetime(df["end"], errors="coerce")
+                df["duration_days"] = (df["end_dt"] - df["start_dt"]).dt.days
+                df = df[df["form"].isin(["10-K", "10-Q", "10-K/A", "10-Q/A"])].copy()
+                return tag, unit, df
+    return "", "", pd.DataFrame()
+
+
+def _sec_format_value(value: Any, unit: str, kind: str) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    try:
+        v = float(value)
+    except Exception:
+        return "—"
+    if unit == "USD/shares" or kind == "eps":
+        return f"${v:,.2f}"
+    if unit == "shares" or kind == "shares":
+        if abs(v) >= 1_000_000_000:
+            return f"{v / 1_000_000_000:,.2f}B"
+        if abs(v) >= 1_000_000:
+            return f"{v / 1_000_000:,.1f}M"
+        return f"{v:,.0f}"
+    return _fmt_raw_money_to_m(v)
+
+
+def _sec_split_periods(df: pd.DataFrame, statement_type: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    if statement_type in {"income", "cashflow"}:
+        annual = df[(df["fp"].astype(str).str.upper() == "FY") | (df["duration_days"] >= 300) | (df["form"].isin(["10-K", "10-K/A"]))].copy()
+        quarterly = df[(df["form"].isin(["10-Q", "10-Q/A"])) & ((df["duration_days"].isna()) | (df["duration_days"] <= 120))].copy()
+    else:
+        annual = df[(df["fp"].astype(str).str.upper() == "FY") | (df["form"].isin(["10-K", "10-K/A"]))].copy()
+        quarterly = df[df["form"].isin(["10-Q", "10-Q/A"])].copy()
+    annual = annual.sort_values(["end_dt", "filed_dt"], ascending=[True, True]).drop_duplicates(subset=["end"], keep="last")
+    quarterly = quarterly.sort_values(["end_dt", "filed_dt"], ascending=[True, True]).drop_duplicates(subset=["end"], keep="last")
+    return annual, quarterly
+
+
+def _sec_period_labels(companyfacts: Dict[str, Any], statement_type: str) -> Tuple[List[str], List[str], Dict[str, str], Dict[str, str]]:
+    annual_ends: List[str] = []
+    quarter_ends: List[str] = []
+    annual_labels: Dict[str, str] = {}
+    quarter_labels: Dict[str, str] = {}
+
+    for _, tags, _ in SEC_STATEMENT_MAP[statement_type]:
+        if not tags or tags == ["__SEC_FCF__"]:
+            continue
+        _, _, df = _sec_fact_records(companyfacts, tags)
+        annual, quarterly = _sec_split_periods(df, statement_type)
+        if not annual.empty:
+            recent_annual = annual.tail(5)
+            annual_ends = [str(x) for x in recent_annual["end"].tolist()]
+            for _, r in recent_annual.iterrows():
+                try:
+                    annual_labels[str(r["end"])] = f"FY{int(r['fy'])}"
+                except Exception:
+                    annual_labels[str(r["end"])] = str(r["end"])
+        if not quarterly.empty:
+            recent_q = quarterly.tail(1)
+            quarter_ends = [str(x) for x in recent_q["end"].tolist()]
+            for _, r in recent_q.iterrows():
+                fp = str(r.get("fp", "Q")).upper()
+                try:
+                    quarter_labels[str(r["end"])] = f"{fp} {int(r['fy'])}"
+                except Exception:
+                    quarter_labels[str(r["end"])] = str(r["end"])
+        if annual_ends or quarter_ends:
+            break
+
+    return annual_ends, quarter_ends, annual_labels, quarter_labels
+
+
+def _sec_value_for_end(companyfacts: Dict[str, Any], tags: List[str], statement_type: str, end: str, period_type: str) -> Tuple[float, str]:
+    _, unit, df = _sec_fact_records(companyfacts, tags)
+    annual, quarterly = _sec_split_periods(df, statement_type)
+    sub = annual if period_type == "annual" else quarterly
+    if sub.empty:
+        return np.nan, unit
+    match = sub[sub["end"].astype(str) == str(end)].sort_values("filed_dt", ascending=False)
+    if match.empty:
+        return np.nan, unit
+    return float(match.iloc[-1]["val"]), str(match.iloc[-1].get("unit", unit))
+
+
+def build_sec_statement_table(companyfacts: Dict[str, Any], statement_type: str) -> pd.DataFrame:
+    """First SEC/XBRL consolidated statement builder using official SEC companyfacts."""
+    if not isinstance(companyfacts, dict) or "facts" not in companyfacts:
+        return pd.DataFrame({"Line Item": ["NO SEC COMPANYFACTS DATA RETURNED"], "Status": ["Check ticker/CIK or SEC availability"]})
+
+    annual_ends, quarter_ends, annual_labels, quarter_labels = _sec_period_labels(companyfacts, statement_type)
+    display_cols = [annual_labels[e] for e in annual_ends] + [quarter_labels[e] for e in quarter_ends]
+
+    if not display_cols:
+        return pd.DataFrame({"Line Item": ["NO MAPPED SEC STATEMENT DATA FOUND"], "Status": ["SEC facts loaded, but mapped tags were unavailable for this company"]})
+
+    rows: List[Dict[str, Any]] = []
+    for label, tags, kind in SEC_STATEMENT_MAP[statement_type]:
+        if tags is None:
+            rows.append({"Line Item": label, **{c: "" for c in display_cols}, "YoY Δ": "", "QoQ Δ": ""})
+            continue
+
+        row = {"Line Item": label}
+        annual_values = []
+        q_value = np.nan
+        q_prior = np.nan
+        unit_for_row = ""
+
+        if tags == ["__SEC_FCF__"]:
+            for end in annual_ends:
+                ocf, unit = _sec_value_for_end(companyfacts, ["NetCashProvidedByUsedInOperatingActivities", "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"], "cashflow", end, "annual")
+                capex, _ = _sec_value_for_end(companyfacts, ["PaymentsToAcquirePropertyPlantAndEquipment", "CapitalExpenditures"], "cashflow", end, "annual")
+                value = ocf - abs(capex) if not pd.isna(ocf) and not pd.isna(capex) else np.nan
+                unit_for_row = unit
+                annual_values.append(value)
+                row[annual_labels[end]] = _sec_format_value(value, unit, kind)
+
+            for end in quarter_ends:
+                ocf, unit = _sec_value_for_end(companyfacts, ["NetCashProvidedByUsedInOperatingActivities", "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"], "cashflow", end, "quarterly")
+                capex, _ = _sec_value_for_end(companyfacts, ["PaymentsToAcquirePropertyPlantAndEquipment", "CapitalExpenditures"], "cashflow", end, "quarterly")
+                q_value = ocf - abs(capex) if not pd.isna(ocf) and not pd.isna(capex) else np.nan
+                unit_for_row = unit
+                row[quarter_labels[end]] = _sec_format_value(q_value, unit, kind)
+        else:
+            for end in annual_ends:
+                value, unit = _sec_value_for_end(companyfacts, tags, statement_type, end, "annual")
+                unit_for_row = unit
+                annual_values.append(value)
+                row[annual_labels[end]] = _sec_format_value(value, unit, kind)
+
+            for end in quarter_ends:
+                q_value, unit = _sec_value_for_end(companyfacts, tags, statement_type, end, "quarterly")
+                unit_for_row = unit
+                row[quarter_labels[end]] = _sec_format_value(q_value, unit, kind)
+
+        if len(annual_values) >= 2 and not pd.isna(annual_values[-1]) and not pd.isna(annual_values[-2]) and annual_values[-2] != 0:
+            row["YoY Δ"] = fmt_pct(((annual_values[-1] / annual_values[-2]) - 1) * 100)
+        else:
+            row["YoY Δ"] = "—"
+
+        row["QoQ Δ"] = "—"
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def render_sec_source_box(ticker: str, sec_info: Dict[str, Any], filings_df: pd.DataFrame) -> None:
+    if not sec_info:
+        st.warning("SEC source unavailable for this ticker. Falling back to yfinance where available.")
+        return
+
+    filing_note = ""
+    if isinstance(filings_df, pd.DataFrame) and not filings_df.empty:
+        latest = filings_df.iloc[0]
+        filing_note = f" Latest filing: {latest.get('Form', '')} filed {latest.get('Filing Date', '')}, period ended {latest.get('Period End', '')}."
+
+    render_summary_box(
+        "SEC filing source",
+        f"{ticker.upper()} maps to CIK {sec_info.get('cik10', '')}. Statements below use official SEC companyfacts/XBRL where mapped tags are available.{filing_note}"
+    )
+
+
 def _coerce_money_from_display(value: Any) -> float:
     if value is None or pd.isna(value):
         return np.nan
@@ -2769,6 +3131,7 @@ with st.sidebar:
     st.markdown("### Financial Dashboard Builder")
     ticker = st.text_input("Ticker", value=TICKER_DEFAULT).upper().strip() or TICKER_DEFAULT
     use_live = st.toggle("Use internet data when available", value=True)
+    use_sec_statements = st.toggle("Use SEC filing statements when available", value=True)
     if st.button("Refresh live data"):
         st.cache_data.clear()
         st.rerun()
@@ -2781,6 +3144,13 @@ fallback_shares_b = 2.55
 
 market_data = get_market_data(ticker) if use_live else {"quote": {}, "history": pd.DataFrame(), "errors": []}
 fundamentals = get_yf_fundamentals(ticker) if use_live else {"income": pd.DataFrame(), "balance": pd.DataFrame(), "cashflow": pd.DataFrame(), "errors": []}
+
+sec_info = sec_lookup_ticker(ticker) if use_live and use_sec_statements else {}
+sec_subs = sec_submissions(sec_info.get("cik10", "")) if sec_info else {}
+sec_facts = sec_companyfacts(sec_info.get("cik10", "")) if sec_info else {}
+sec_filings = sec_filings_table(sec_subs) if sec_subs else pd.DataFrame()
+sec_statements_available = bool(sec_info) and isinstance(sec_facts, dict) and "facts" in sec_facts
+
 quote = market_data.get("quote", {}) if market_data else {}
 current_price = quote.get("last_price") or fallback_price
 shares_b = (quote.get("shares") / 1e9) if quote.get("shares") else fallback_shares_b
@@ -2894,9 +3264,21 @@ with tabs[0]:
     render_summary_box("Ratio read", make_ratio_summary(ratio_df))
     display_df(ratio_df, height=620, style_rows=False)
 
+    if sec_info:
+        st.markdown("<div class='section-label'>SEC Filing Metadata</div>", unsafe_allow_html=True)
+        render_sec_source_box(ticker, sec_info, sec_filings)
+        if isinstance(sec_filings, pd.DataFrame) and not sec_filings.empty:
+            display_df(sec_filings, height=260, style_rows=False)
+
 with tabs[1]:
     st.markdown("<div class='section-label'>Income Statement</div>", unsafe_allow_html=True)
-    if is_live_generic:
+    if sec_statements_available:
+        df_income = build_sec_statement_table(sec_facts, "income")
+        render_sec_source_box(ticker, sec_info, sec_filings)
+        render_summary_box("Income statement read", make_income_summary(df_income))
+        render_financial_table(df_income)
+        st.caption("SEC/XBRL consolidated income statement. Falls back by mapped tag availability; yfinance remains available when SEC is toggled off.")
+    elif is_live_generic:
         df_income = build_live_statement_table_wide(fundamentals, "income")
         render_summary_box("Income statement read", make_income_summary(df_income))
         render_financial_table(df_income)
@@ -2914,7 +3296,13 @@ with tabs[1]:
 
 with tabs[2]:
     st.markdown("<div class='section-label'>Balance Sheet</div>", unsafe_allow_html=True)
-    if is_live_generic:
+    if sec_statements_available:
+        df_balance = build_sec_statement_table(sec_facts, "balance")
+        render_sec_source_box(ticker, sec_info, sec_filings)
+        render_summary_box("Balance sheet read", make_balance_summary(df_balance))
+        render_financial_table(df_balance)
+        st.caption("SEC/XBRL consolidated balance sheet. Falls back by mapped tag availability; yfinance remains available when SEC is toggled off.")
+    elif is_live_generic:
         df_balance = build_live_statement_table_wide(fundamentals, "balance")
         render_summary_box("Balance sheet read", make_balance_summary(df_balance))
         render_financial_table(df_balance)
@@ -2930,7 +3318,13 @@ with tabs[2]:
 
 with tabs[3]:
     st.markdown("<div class='section-label'>Cash Flow</div>", unsafe_allow_html=True)
-    if is_live_generic:
+    if sec_statements_available:
+        df_cash = build_sec_statement_table(sec_facts, "cashflow")
+        render_sec_source_box(ticker, sec_info, sec_filings)
+        render_summary_box("Cash-flow read", make_cashflow_summary(df_cash))
+        render_financial_table(df_cash)
+        st.caption("SEC/XBRL consolidated cash-flow statement. Falls back by mapped tag availability; yfinance remains available when SEC is toggled off.")
+    elif is_live_generic:
         df_cash = build_live_statement_table_wide(fundamentals, "cashflow")
         render_summary_box("Cash-flow read", make_cashflow_summary(df_cash))
         render_financial_table(df_cash)
@@ -3294,9 +3688,9 @@ with tabs[9]:
     st.markdown("<div class='section-label'>Export Dashboard Data</div>", unsafe_allow_html=True)
     if is_live_generic:
         export_tables = {
-            "live_income_statement": build_live_statement_table_wide(fundamentals, "income"),
-            "live_balance_sheet": build_live_statement_table_wide(fundamentals, "balance"),
-            "live_cash_flow": build_live_statement_table_wide(fundamentals, "cashflow"),
+            "live_income_statement": build_sec_statement_table(sec_facts, "income") if sec_statements_available else build_live_statement_table_wide(fundamentals, "income"),
+            "live_balance_sheet": build_sec_statement_table(sec_facts, "balance") if sec_statements_available else build_live_statement_table_wide(fundamentals, "balance"),
+            "live_cash_flow": build_sec_statement_table(sec_facts, "cashflow") if sec_statements_available else build_live_statement_table_wide(fundamentals, "cashflow"),
             "live_operating_profile": build_live_operating_profile(fundamentals),
             "live_forward_view": build_live_forward_view(market_data, quote, current_price, market_cap_b, base_revenue_b),
             "live_annual_metrics": build_live_annual_metrics(fundamentals),

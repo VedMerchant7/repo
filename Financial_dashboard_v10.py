@@ -539,7 +539,7 @@ def display_df(df: pd.DataFrame, height: Optional[int] = None, style_rows: bool 
             ])
         )
 
-        delta_cols = [c for c in ["YoY Δ", "QoQ Δ", "Upside / Downside", "Price CAGR", "Latest Qtr Margin"] if c in df.columns]
+        delta_cols = [c for c in ["YoY Δ", "QoQ Δ", "Upside / Downside", "Price CAGR"] if c in df.columns]
         if delta_cols:
             if hasattr(styled, "map"):
                 styled = styled.map(color_delta_cells, subset=delta_cols)
@@ -597,7 +597,7 @@ def render_financial_table(df: pd.DataFrame, height: Optional[int] = None) -> No
             if c in ["Q1'26 Margin", "Q1’26 Margin"] and kind == "grand":
                 td_cls.append("margin-hot")
             class_attr = f' class="{" ".join(td_cls)}"' if td_cls else ""
-            if c in ["YoY Δ", "QoQ Δ", "Upside / Downside", "Price CAGR", "Latest Qtr Margin"]:
+            if c in ["YoY Δ", "QoQ Δ", "Upside / Downside", "Price CAGR"]:
                 content = _delta_badge(val)
             else:
                 content = _html_escape(val)
@@ -1641,205 +1641,6 @@ def build_live_statement_table_wide(fundamentals: Dict[str, Any], statement_type
             rows.append(row)
 
     return pd.DataFrame(rows)
-
-
-def _format_full_statement_value(line_item: str, value: Any) -> str:
-    """Format raw yfinance statement values for dashboard display."""
-    if value is None or pd.isna(value):
-        return "—"
-
-    label = str(line_item).lower()
-    try:
-        v = float(value)
-    except Exception:
-        return str(value)
-
-    if "eps" in label or "earnings per share" in label:
-        return f"${v:,.2f}"
-
-    if "margin" in label or "ratio" in label or "rate" in label:
-        return f"{v * 100:.1f}%" if abs(v) <= 1 else f"{v:.1f}%"
-
-    if "shares" in label or "share count" in label or "average share" in label:
-        if abs(v) >= 1_000_000_000:
-            return f"{v / 1_000_000_000:,.2f}B"
-        if abs(v) >= 1_000_000:
-            return f"{v / 1_000_000:,.1f}M"
-        return f"{v:,.0f}"
-
-    if abs(v) >= 1_000_000_000:
-        return f"${v / 1_000_000_000:,.2f}B"
-    if abs(v) >= 1_000_000:
-        return f"${v / 1_000_000:,.0f}M"
-    if abs(v) >= 1_000:
-        return f"${v / 1_000:,.1f}K"
-    return f"${v:,.0f}"
-
-
-def _clean_statement_label(label: Any) -> str:
-    """Clean yfinance/Yahoo statement row labels for display without fragile regex lookarounds."""
-    text_label = str(label).replace("_", " ").strip()
-
-    cleaned_chars = []
-    for i, ch in enumerate(text_label):
-        prev = text_label[i - 1] if i > 0 else ""
-        nxt = text_label[i + 1] if i + 1 < len(text_label) else ""
-        if i > 0 and ch.isupper() and (prev.islower() or (prev.isupper() and nxt.islower())):
-            cleaned_chars.append(" ")
-        cleaned_chars.append(ch)
-
-    text_label = "".join(cleaned_chars)
-    text_label = " ".join(text_label.split())
-
-    replacements = {
-        "E B I T D A": "EBITDA",
-        "E B I T": "EBIT",
-        "E P S": "EPS",
-        "F C F": "FCF",
-        "G A A P": "GAAP",
-        "R O E": "ROE",
-        "R O A": "ROA",
-        "U S D": "USD",
-    }
-    for old, new in replacements.items():
-        text_label = text_label.replace(old, new)
-
-    return text_label
-
-
-def build_full_live_statement_table_wide(fundamentals: Dict[str, Any], statement_type: str) -> pd.DataFrame:
-    """Build a complete Yahoo-style statement table using every line item yfinance returns."""
-    if statement_type == "income":
-        annual_raw = fundamentals.get("annual_income", pd.DataFrame())
-        quarter_raw = fundamentals.get("income", pd.DataFrame())
-        annual_cashflow_raw = fundamentals.get("annual_cashflow", pd.DataFrame())
-        quarter_cashflow_raw = fundamentals.get("cashflow", pd.DataFrame())
-        section_title = "COMPLETE INCOME STATEMENT"
-    elif statement_type == "balance":
-        annual_raw = fundamentals.get("annual_balance", pd.DataFrame())
-        quarter_raw = fundamentals.get("balance", pd.DataFrame())
-        annual_cashflow_raw = pd.DataFrame()
-        quarter_cashflow_raw = pd.DataFrame()
-        section_title = "COMPLETE BALANCE SHEET"
-    else:
-        annual_raw = fundamentals.get("annual_cashflow", pd.DataFrame())
-        quarter_raw = fundamentals.get("cashflow", pd.DataFrame())
-        annual_cashflow_raw = pd.DataFrame()
-        quarter_cashflow_raw = pd.DataFrame()
-        section_title = "COMPLETE CASH FLOW STATEMENT"
-
-    annual_cols = []
-    if isinstance(annual_raw, pd.DataFrame) and not annual_raw.empty:
-        annual_cols = list(annual_raw.columns)
-        try:
-            annual_cols = sorted(annual_cols, key=lambda c: pd.to_datetime(c))
-        except Exception:
-            pass
-        annual_cols = annual_cols[-6:]
-
-    q_cols = []
-    if isinstance(quarter_raw, pd.DataFrame) and not quarter_raw.empty:
-        q_cols = list(quarter_raw.columns)
-        try:
-            q_cols = sorted(q_cols, key=lambda c: pd.to_datetime(c), reverse=True)
-        except Exception:
-            pass
-
-    latest_q = q_cols[0] if q_cols else None
-    prior_q = q_cols[1] if len(q_cols) > 1 else None
-    prior_y_q = q_cols[4] if len(q_cols) > 4 else None
-
-    if not annual_cols and latest_q is None:
-        return pd.DataFrame({
-            "Line Item": ["NO LIVE STATEMENT DATA RETURNED"],
-            "Status": ["Check ticker, internet connection, or yfinance availability"],
-        })
-
-    annual_labels = []
-    for c in annual_cols:
-        try:
-            annual_labels.append(f"FY{pd.to_datetime(c).year}")
-        except Exception:
-            annual_labels.append(str(c))
-
-    q_label = "Latest Qtr"
-    if latest_q is not None:
-        try:
-            q_label = pd.to_datetime(latest_q).strftime("%b %Y")
-        except Exception:
-            q_label = str(latest_q)
-
-    display_cols = annual_labels + ([q_label] if latest_q is not None else [])
-    rows: List[Dict[str, Any]] = []
-    rows.append({"Line Item": section_title, **{c: "" for c in display_cols}, "YoY Δ": "", "QoQ Δ": "", "Latest Qtr Margin": ""})
-
-    line_items: List[Any] = []
-    for raw in [annual_raw, quarter_raw]:
-        if isinstance(raw, pd.DataFrame) and not raw.empty:
-            for item in raw.index:
-                if item not in line_items:
-                    line_items.append(item)
-
-    revenue_latest = _get_statement_value(quarter_raw, ["Total Revenue", "Operating Revenue"], latest_q) if latest_q is not None else np.nan
-
-    for item in line_items:
-        item_label = _clean_statement_label(item)
-        row = {"Line Item": item_label}
-
-        for col_label, raw_col in zip(annual_labels, annual_cols):
-            val = _get_statement_value(annual_raw, [str(item)], raw_col)
-            row[col_label] = _format_full_statement_value(item_label, val)
-
-        q_val = _get_statement_value(quarter_raw, [str(item)], latest_q) if latest_q is not None else np.nan
-        if latest_q is not None:
-            row[q_label] = _format_full_statement_value(item_label, q_val)
-
-        prior_y_val = _get_statement_value(quarter_raw, [str(item)], prior_y_q) if prior_y_q is not None else np.nan
-        prior_q_val = _get_statement_value(quarter_raw, [str(item)], prior_q) if prior_q is not None else np.nan
-        row["YoY Δ"] = _pct_change(q_val, prior_y_val)
-        row["QoQ Δ"] = _pct_change(q_val, prior_q_val)
-
-        if statement_type == "income" and not pd.isna(q_val) and not pd.isna(revenue_latest) and revenue_latest != 0:
-            label_lower = item_label.lower()
-            if not ("eps" in label_lower or "shares" in label_lower or "tax rate" in label_lower):
-                row["Latest Qtr Margin"] = f"{safe_div(q_val, revenue_latest) * 100:.1f}%"
-            else:
-                row["Latest Qtr Margin"] = "—"
-        else:
-            row["Latest Qtr Margin"] = "—"
-
-        rows.append(row)
-
-    if statement_type == "income":
-        rows.append({"Line Item": "SHAREHOLDER RETURNS", **{c: "" for c in display_cols}, "YoY Δ": "", "QoQ Δ": "", "Latest Qtr Margin": ""})
-
-        divs_q, buybacks_q, q_total = _shareholder_return_components(quarter_cashflow_raw, latest_q) if latest_q is not None else (np.nan, np.nan, np.nan)
-        shareholder_row = {"Line Item": "Total Returns (Divs + Buybacks)"}
-
-        for col_label, raw_col in zip(annual_labels, annual_cols):
-            _, _, total = _shareholder_return_components(annual_cashflow_raw, raw_col)
-            shareholder_row[col_label] = _format_full_statement_value("Total Returns", total)
-
-        if latest_q is not None:
-            shareholder_row[q_label] = _format_full_statement_value("Total Returns", q_total)
-
-        prior_y_total = np.nan
-        prior_q_total = np.nan
-        if prior_y_q is not None:
-            _, _, prior_y_total = _shareholder_return_components(quarter_cashflow_raw, prior_y_q)
-        if prior_q is not None:
-            _, _, prior_q_total = _shareholder_return_components(quarter_cashflow_raw, prior_q)
-
-        shareholder_row["YoY Δ"] = _pct_change(q_total, prior_y_total)
-        shareholder_row["QoQ Δ"] = _pct_change(q_total, prior_q_total)
-        shareholder_row["Latest Qtr Margin"] = (
-            f"Divs {_fmt_raw_money_to_m(divs_q)} · Buybacks {_fmt_raw_money_to_m(buybacks_q)}"
-            if not pd.isna(q_total) else "—"
-        )
-        rows.append(shareholder_row)
-
-    return pd.DataFrame(rows)
-
 
 
 def build_live_kpis(fundamentals: Dict[str, Any], quote: Dict[str, Any], market_cap_b: float) -> List[Tuple[str, str, str]]:
@@ -3096,10 +2897,10 @@ with tabs[0]:
 with tabs[1]:
     st.markdown("<div class='section-label'>Income Statement</div>", unsafe_allow_html=True)
     if is_live_generic:
-        df_income = build_full_live_statement_table_wide(fundamentals, "income")
+        df_income = build_live_statement_table_wide(fundamentals, "income")
         render_summary_box("Income statement read", make_income_summary(df_income))
         render_financial_table(df_income)
-        st.caption("Complete live income statement from yfinance. This includes all rows returned by Yahoo Finance for the ticker.")
+        st.caption("Consolidated live income statement from yfinance. This focuses on the most useful rows for dashboard readability.")
     else:
         df_income = statement_df(income_rows, include_margins=True)
         render_summary_box("Income statement read", make_income_summary(df_income))
@@ -3114,10 +2915,10 @@ with tabs[1]:
 with tabs[2]:
     st.markdown("<div class='section-label'>Balance Sheet</div>", unsafe_allow_html=True)
     if is_live_generic:
-        df_balance = build_full_live_statement_table_wide(fundamentals, "balance")
+        df_balance = build_live_statement_table_wide(fundamentals, "balance")
         render_summary_box("Balance sheet read", make_balance_summary(df_balance))
         render_financial_table(df_balance)
-        st.caption("Complete live balance sheet from yfinance. This includes all rows returned by Yahoo Finance for the ticker.")
+        st.caption("Consolidated live balance sheet from yfinance. This focuses on the most useful rows for dashboard readability.")
     else:
         df_balance = simple_statement_df(balance_rows)
         render_summary_box("Balance sheet read", make_balance_summary(df_balance))
@@ -3130,10 +2931,10 @@ with tabs[2]:
 with tabs[3]:
     st.markdown("<div class='section-label'>Cash Flow</div>", unsafe_allow_html=True)
     if is_live_generic:
-        df_cash = build_full_live_statement_table_wide(fundamentals, "cashflow")
+        df_cash = build_live_statement_table_wide(fundamentals, "cashflow")
         render_summary_box("Cash-flow read", make_cashflow_summary(df_cash))
         render_financial_table(df_cash)
-        st.caption("Complete live cash-flow statement from yfinance. This includes all rows returned by Yahoo Finance for the ticker.")
+        st.caption("Consolidated live cash-flow statement from yfinance. This focuses on the most useful rows for dashboard readability.")
     else:
         df_cash = simple_statement_df(cash_rows)
         render_summary_box("Cash-flow read", make_cashflow_summary(df_cash))
@@ -3493,9 +3294,9 @@ with tabs[9]:
     st.markdown("<div class='section-label'>Export Dashboard Data</div>", unsafe_allow_html=True)
     if is_live_generic:
         export_tables = {
-            "live_income_statement": build_full_live_statement_table_wide(fundamentals, "income"),
-            "live_balance_sheet": build_full_live_statement_table_wide(fundamentals, "balance"),
-            "live_cash_flow": build_full_live_statement_table_wide(fundamentals, "cashflow"),
+            "live_income_statement": build_live_statement_table_wide(fundamentals, "income"),
+            "live_balance_sheet": build_live_statement_table_wide(fundamentals, "balance"),
+            "live_cash_flow": build_live_statement_table_wide(fundamentals, "cashflow"),
             "live_operating_profile": build_live_operating_profile(fundamentals),
             "live_forward_view": build_live_forward_view(market_data, quote, current_price, market_cap_b, base_revenue_b),
             "live_annual_metrics": build_live_annual_metrics(fundamentals),

@@ -2900,7 +2900,7 @@ with tabs[1]:
         df_income = build_live_statement_table_wide(fundamentals, "income")
         render_summary_box("Income statement read", make_income_summary(df_income))
         render_financial_table(df_income)
-        st.caption("Consolidated live income statement from yfinance. This focuses on the most useful rows for dashboard readability.")
+        st.caption("Live income statement from yfinance. Line-item names vary by company and Yahoo availability.")
     else:
         df_income = statement_df(income_rows, include_margins=True)
         render_summary_box("Income statement read", make_income_summary(df_income))
@@ -2918,7 +2918,7 @@ with tabs[2]:
         df_balance = build_live_statement_table_wide(fundamentals, "balance")
         render_summary_box("Balance sheet read", make_balance_summary(df_balance))
         render_financial_table(df_balance)
-        st.caption("Consolidated live balance sheet from yfinance. This focuses on the most useful rows for dashboard readability.")
+        st.caption("Live balance sheet from yfinance. Line-item availability varies by company.")
     else:
         df_balance = simple_statement_df(balance_rows)
         render_summary_box("Balance sheet read", make_balance_summary(df_balance))
@@ -2934,7 +2934,7 @@ with tabs[3]:
         df_cash = build_live_statement_table_wide(fundamentals, "cashflow")
         render_summary_box("Cash-flow read", make_cashflow_summary(df_cash))
         render_financial_table(df_cash)
-        st.caption("Consolidated live cash-flow statement from yfinance. This focuses on the most useful rows for dashboard readability.")
+        st.caption("Live cash-flow statement from yfinance. Line-item availability varies by company.")
     else:
         df_cash = simple_statement_df(cash_rows)
         render_summary_box("Cash-flow read", make_cashflow_summary(df_cash))

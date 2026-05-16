@@ -2029,6 +2029,18 @@ SEC_STATEMENT_MAP = {
 }
 
 
+SEC_ANNUAL_HISTORY_YEARS = 6
+
+
+def _calendar_quarter_label(end_value: Any) -> str:
+    """Label quarter by calendar period end to avoid confusing fiscal labels."""
+    try:
+        ts = pd.to_datetime(end_value)
+        return f"Q{ts.quarter} {ts.year}"
+    except Exception:
+        return str(end_value)
+
+
 def _sec_prepare_fact_df(raw_rows: List[Dict[str, Any]], tag: str, unit: str) -> pd.DataFrame:
     df = pd.DataFrame(raw_rows)
     if df.empty or "val" not in df.columns:
@@ -2048,16 +2060,11 @@ def _sec_prepare_fact_df(raw_rows: List[Dict[str, Any]], tag: str, unit: str) ->
     return df
 
 
-def _sec_fact_records(companyfacts: Dict[str, Any], tags: List[str]) -> Tuple[str, str, pd.DataFrame]:
-    """Return the best available SEC fact dataframe for a list of candidate tags.
-
-    Instead of taking the first tag that exists, choose the tag with the newest and richest
-    usable history. This avoids stale tags such as older revenue concepts creating only a
-    couple of old columns.
-    """
+def _sec_all_fact_records(companyfacts: Dict[str, Any], tags: List[str]) -> List[Tuple[str, str, pd.DataFrame]]:
+    """Return all available SEC fact dataframes for candidate tags."""
     facts = companyfacts.get("facts", {}) if isinstance(companyfacts, dict) else {}
     us_gaap = facts.get("us-gaap", {})
-    candidates: List[Tuple[str, str, pd.DataFrame, pd.Timestamp, int]] = []
+    candidates: List[Tuple[str, str, pd.DataFrame]] = []
 
     for tag in tags:
         if tag not in us_gaap:
@@ -2080,9 +2087,16 @@ def _sec_fact_records(companyfacts: Dict[str, Any], tags: List[str]) -> Tuple[st
                     break
 
         df = _sec_prepare_fact_df(arr, tag, unit)
-        if df.empty:
-            continue
+        if not df.empty:
+            candidates.append((tag, unit, df))
 
+    return candidates
+
+
+def _sec_fact_records(companyfacts: Dict[str, Any], tags: List[str]) -> Tuple[str, str, pd.DataFrame]:
+    """Return the single newest/richest SEC fact dataframe for backward compatibility."""
+    candidates = []
+    for tag, unit, df in _sec_all_fact_records(companyfacts, tags):
         max_end = df["end_dt"].max()
         usable_count = int(df["val"].notna().sum())
         candidates.append((tag, unit, df, max_end, usable_count))
@@ -2144,10 +2158,11 @@ def _sec_split_periods(df: pd.DataFrame, statement_type: str) -> Tuple[pd.DataFr
 
 
 def _sec_period_labels(companyfacts: Dict[str, Any], statement_type: str) -> Tuple[List[str], List[str], Dict[str, str], Dict[str, str]]:
-    """Collect a union of recent periods across all mapped rows.
+    """Collect recent annual and latest quarterly periods across every candidate tag.
 
-    The prior first-rev logic stopped after the first mapped tag. If that tag was sparse
-    or stale, the table could show only a couple of columns like FY2020 and FY2022.
+    This is intentionally a union across tags, because companies frequently switch
+    XBRL concepts over time. Example: older revenue years may use a different tag
+    than the newest revenue years.
     """
     annual_periods: Dict[str, Tuple[pd.Timestamp, str]] = {}
     quarter_periods: Dict[str, Tuple[pd.Timestamp, str]] = {}
@@ -2156,39 +2171,33 @@ def _sec_period_labels(companyfacts: Dict[str, Any], statement_type: str) -> Tup
         if not tags or tags == ["__SEC_FCF__"]:
             continue
 
-        _, _, df = _sec_fact_records(companyfacts, tags)
-        if df.empty:
-            continue
+        for _, _, df in _sec_all_fact_records(companyfacts, tags):
+            annual, quarterly = _sec_split_periods(df, statement_type)
 
-        annual, quarterly = _sec_split_periods(df, statement_type)
+            for _, r in annual.iterrows():
+                end = str(r.get("end", ""))
+                if not end:
+                    continue
+                end_dt = r.get("end_dt", pd.NaT)
+                try:
+                    label = f"FY{int(r['fy'])}" if not pd.isna(r.get("fy")) else f"FY{pd.to_datetime(end).year}"
+                except Exception:
+                    label = end
+                annual_periods[end] = (end_dt, label)
 
-        for _, r in annual.iterrows():
-            end = str(r.get("end", ""))
-            if not end:
-                continue
-            end_dt = r.get("end_dt", pd.NaT)
-            try:
-                label = f"FY{int(r['fy'])}" if not pd.isna(r.get("fy")) else f"FY{pd.to_datetime(end).year}"
-            except Exception:
-                label = end
-            annual_periods[end] = (end_dt, label)
-
-        for _, r in quarterly.iterrows():
-            end = str(r.get("end", ""))
-            if not end:
-                continue
-            end_dt = r.get("end_dt", pd.NaT)
-            fp = str(r.get("fp", "Q")).upper()
-            try:
-                label = f"{fp} {int(r['fy'])}" if not pd.isna(r.get("fy")) else f"{fp} {pd.to_datetime(end).year}"
-            except Exception:
-                label = end
-            quarter_periods[end] = (end_dt, label)
+            for _, r in quarterly.iterrows():
+                end = str(r.get("end", ""))
+                if not end:
+                    continue
+                end_dt = r.get("end_dt", pd.NaT)
+                # Use calendar quarter label. SEC fiscal labels can show confusing rows like Q3 2026.
+                label = _calendar_quarter_label(end)
+                quarter_periods[end] = (end_dt, label)
 
     annual_sorted = sorted(
         annual_periods.items(),
         key=lambda kv: pd.Timestamp.min if pd.isna(kv[1][0]) else kv[1][0],
-    )[-5:]
+    )[-SEC_ANNUAL_HISTORY_YEARS:]
     quarter_sorted = sorted(
         quarter_periods.items(),
         key=lambda kv: pd.Timestamp.min if pd.isna(kv[1][0]) else kv[1][0],
@@ -2202,20 +2211,39 @@ def _sec_period_labels(companyfacts: Dict[str, Any], statement_type: str) -> Tup
 
 
 def _sec_value_for_end(companyfacts: Dict[str, Any], tags: List[str], statement_type: str, end: str, period_type: str) -> Tuple[float, str]:
-    tag, unit, df = _sec_fact_records(companyfacts, tags)
-    if df.empty:
-        return np.nan, unit
+    """Find a value for a specific period by trying all candidate tags.
 
-    annual, quarterly = _sec_split_periods(df, statement_type)
-    sub = annual if period_type == "annual" else quarterly
-    if sub.empty:
-        return np.nan, unit
+    This solves the missing older-year problem when the newest tag does not cover
+    the company's full history.
+    """
+    best_value = np.nan
+    best_unit = ""
+    best_filed = pd.Timestamp.min
 
-    match = sub[sub["end"].astype(str) == str(end)].sort_values("filed_dt", ascending=True)
-    if match.empty:
-        return np.nan, unit
+    for tag, unit, df in _sec_all_fact_records(companyfacts, tags):
+        annual, quarterly = _sec_split_periods(df, statement_type)
+        sub = annual if period_type == "annual" else quarterly
+        if sub.empty:
+            continue
 
-    return float(match.iloc[-1]["val"]), str(match.iloc[-1].get("unit", unit))
+        match = sub[sub["end"].astype(str) == str(end)].sort_values("filed_dt", ascending=True)
+        if match.empty:
+            continue
+
+        rr = match.iloc[-1]
+        filed_dt = rr.get("filed_dt", pd.Timestamp.min)
+        if pd.isna(filed_dt):
+            filed_dt = pd.Timestamp.min
+
+        if pd.isna(best_value) or filed_dt >= best_filed:
+            try:
+                best_value = float(rr["val"])
+                best_unit = str(rr.get("unit", unit))
+                best_filed = filed_dt
+            except Exception:
+                pass
+
+    return best_value, best_unit
 
 
 def build_sec_statement_table(companyfacts: Dict[str, Any], statement_type: str) -> pd.DataFrame:
@@ -2291,7 +2319,7 @@ def render_sec_source_box(ticker: str, sec_info: Dict[str, Any], filings_df: pd.
 
     render_summary_box(
         "SEC filing source",
-        f"{ticker.upper()} maps to CIK {sec_info.get('cik10', '')}. Statements below use official SEC companyfacts/XBRL where mapped tags are available.{filing_note}"
+        f"{ticker.upper()} maps to CIK {sec_info.get('cik10', '')}. Statements below use official SEC companyfacts/XBRL where mapped tags are available. Quarter labels use calendar period-end quarters to avoid confusing fiscal-quarter labels.{filing_note}"
     )
 
 

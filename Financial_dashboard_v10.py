@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 import traceback
 import time
 from dataclasses import dataclass
@@ -1643,8 +1644,10 @@ def build_live_statement_table_wide(fundamentals: Dict[str, Any], statement_type
 
 
 def _format_full_statement_value(line_item: str, value: Any) -> str:
+    """Format raw yfinance statement values for dashboard display."""
     if value is None or pd.isna(value):
         return "—"
+
     label = str(line_item).lower()
     try:
         v = float(value)
@@ -1654,7 +1657,7 @@ def _format_full_statement_value(line_item: str, value: Any) -> str:
     if "eps" in label or "earnings per share" in label:
         return f"${v:,.2f}"
 
-    if "margin" in label or "ratio" in label:
+    if "margin" in label or "ratio" in label or "rate" in label:
         return f"{v * 100:.1f}%" if abs(v) <= 1 else f"{v:.1f}%"
 
     if "shares" in label or "share count" in label or "average share" in label:
@@ -1674,20 +1677,38 @@ def _format_full_statement_value(line_item: str, value: Any) -> str:
 
 
 def _clean_statement_label(label: Any) -> str:
+    """Clean yfinance/Yahoo statement row labels for display without fragile regex lookarounds."""
     text_label = str(label).replace("_", " ").strip()
-    text_label = re.sub(r"(?<!^)(?=[A-Z][a-z])", " ", text_label)
-    text_label = re.sub(r"\s+", " ", text_label).strip()
+
+    cleaned_chars = []
+    for i, ch in enumerate(text_label):
+        prev = text_label[i - 1] if i > 0 else ""
+        nxt = text_label[i + 1] if i + 1 < len(text_label) else ""
+        if i > 0 and ch.isupper() and (prev.islower() or (prev.isupper() and nxt.islower())):
+            cleaned_chars.append(" ")
+        cleaned_chars.append(ch)
+
+    text_label = "".join(cleaned_chars)
+    text_label = " ".join(text_label.split())
+
     replacements = {
         "E B I T D A": "EBITDA",
         "E B I T": "EBIT",
         "E P S": "EPS",
+        "F C F": "FCF",
+        "G A A P": "GAAP",
+        "R O E": "ROE",
+        "R O A": "ROA",
+        "U S D": "USD",
     }
     for old, new in replacements.items():
         text_label = text_label.replace(old, new)
+
     return text_label
 
 
 def build_full_live_statement_table_wide(fundamentals: Dict[str, Any], statement_type: str) -> pd.DataFrame:
+    """Build a complete Yahoo-style statement table using every line item yfinance returns."""
     if statement_type == "income":
         annual_raw = fundamentals.get("annual_income", pd.DataFrame())
         quarter_raw = fundamentals.get("income", pd.DataFrame())
